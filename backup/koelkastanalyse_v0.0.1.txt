@@ -1,0 +1,1061 @@
+"""
+1D.3 Compartment average air temperatures determination
+    D.3.1 General
+    For each compartment, the average air temperature at each sensor location is determined.
+    These temperatures are then combined to determine the compartment temperature.
+
+    D.3.2 Determination of the average temperature of a sensor over a period
+    The average temperature of a sensor over a period shall be determined by integration. More
+    frequent sampling for selected periods during the test may be used. For example, higher
+    frequency sampling may be useful for short duration events. If it is necessary to combine data
+    with dissimilar sampling rates, each data point shall be weighted in proportion to its relevant
+    sampling period.
+
+    D.3.3 Determination of the temperature of a compartment
+    The temperature of a compartment shall be determined over the applicable temperature
+    determination period.
+
+    D.3.4 Calculation of temperature average
+    The compartment temperature shall be the arithmetic mean of the temperatures for all
+    temperature sensors in the compartment.
+"""
+
+"""
+Dit programma verwerkt ruwe meetdata van vermogensmeters en temperatuursensoren om de 
+efficiëntie van een koelapparaat te kwantificeren volgens specifieke teststandaarden.
+
+KERNBEGRIPPEN:
+1. Cycles (TCC - Temperature Control Cycles):
+   Dit zijn de individuele aan/uit-cycli van de compressor. 
+   - 'On-duration': De tijd dat de compressor actief koelt.
+   - 'TCC_duration': De totale tijd van het begin van één koelactie tot de volgende.
+   Het script identificeert deze cycli door een drempelwaarde (threshold) toe te passen
+   op het (gefilterde) vermogenssignaal.
+
+2. Periods (Analyseperioden):
+   Een 'Period' is een aaneengesloten reeks van meerdere TCC's (bijv. 3 blokken van 'k' cycli).
+   Deze worden gebruikt om te controleren op stabiliteit.
+   - Steady-State (SS): Een periode waarin de gemiddelde temperatuur en het vermogen 
+     binnen strikte toleranties blijven (bijv. < 0.25K drift).
+   - D- en F-perioden: Specifieke stabiele perioden direct vóór (D - Departure) en 
+     na (F - Finish) een ontdooicyclus om de herstelenergie te berekenen.
+
+HOOFDPROCEDURE:
+- Data Ingestie: Laden van vermogensdata (Power) en temperatuurdata (CSV/UTF-16).
+- Filtering: Toepassen van median-filters om ruis te verwijderen en piekniveaus 
+  (compressor aan) versus basisniveaus (compressor uit) te bepalen via histogrammen.
+- TCC Segmentatie: Het opsplitsen van de tijdslijn in individuele compressor-acties.
+- Steady-State Detectie: Het algoritmisch zoeken naar de meest stabiele 6- tot 12-uurs 
+  vensters waarin het apparaat thermisch in evenwicht is.
+- Ontdooi-analyse: Het detecteren van 'Defrost' pieken en het berekenen van de 
+  bijbehorende energie-impact (Delta_E_dfj) door het verbruik rondom de ontdooiing 
+  te vergelijken met de stabiele perioden (D en F).
+- Calculatie: Berekening van het uiteindelijke dagelijkse energieverbruik (pss) 
+  gecorrigeerd naar een standaard omgevingstemperatuur.
+"""
+
+from time import time
+
+start_time = time()
+from datetime import timedelta
+import numpy as np
+import polars as pl
+import polars.selectors as cs
+import sys
+
+end_time = time()
+print(f"loading imports took {end_time - start_time:.5f} seconds")
+
+DEBUG = True
+DEBUG = False
+DEBUG3 = True
+DEBUG3 = False
+
+start_time = time()
+if DEBUG or DEBUG3:
+    from matplotlib import pyplot as plt
+    import matplotlib.dates as mdates
+
+    def format_dates(fig, ax):
+        fig.autofmt_xdate()
+        ax.xaxis.set_major_locator(mdates.DayLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+        ax.xaxis.set_minor_locator(mdates.HourLocator(interval=6))
+        ax.xaxis.set_minor_formatter(mdates.DateFormatter("%H:%M"))
+        # move date labels down a bit: increase pad and give more bottom margin
+        ax.tick_params(
+            axis="x", which="minor", length=6, labelsize=8, labelbottom=True, pad=6
+        )
+        ax.tick_params(axis="x", which="major", length=10, labelsize=9, pad=10)
+        fig.autofmt_xdate(rotation=30)
+        # fig.subplots_adjust(bottom=3.52)
+        ax.set_axisbelow(True)
+        # ensure vertical grid lines at major and minor x ticks
+        ax.xaxis.grid(
+            True, which="major", linestyle="-", linewidth=0.8, color="gray", alpha=0.6
+        )
+        ax.xaxis.grid(
+            True, which="minor", linestyle="--", linewidth=0.6, color="gray", alpha=0.4
+        )
+
+
+compartments = {
+    "fridge": {
+        "temp sensors": ["105 (C)", "202 (C)", "209 (C)"],
+        "volume": 233,
+        "compartment type": "unfrozen",
+        "target_temp": 4,
+    },
+    "freezer 3 star": {
+        "temp sensors": ["102 (C)", "103 (C)", "201 (C)", "203 (C)", "107 (C)"],
+        "volume": 107,
+        "compartment type": "frozen",
+        "target_temp": -18,
+    },
+}
+
+# check if there are both frozen and unfrozen compartments
+N_compartment_types = len(
+    {compartment["compartment type"] for compartment in compartments.values()}
+)
+N_compartments = len(compartments.keys())
+
+# achterhaal welke van de compartments gebruikt moeten worden voor de periode selectie
+name_vol_type = [
+    {
+        "name": compartment_name,
+        "volume": compartment_specs["volume"],
+        "type": compartment_specs["compartment type"],
+    }
+    for compartment_name, compartment_specs in compartments.items()
+]
+# lists of compartments that are frozen or unfrozen sorted by volume
+frozen_compartment_sorted_by_volume = [
+    z["name"]
+    for z in sorted(
+        filter(lambda x: x["type"] == "frozen", name_vol_type),
+        key=lambda y: y["volume"],
+        reverse=True,
+    )
+]
+unfrozen_compartment_sorted_by_volume = [
+    z["name"]
+    for z in sorted(
+        filter(lambda x: x["type"] == "unfrozen", name_vol_type),
+        key=lambda y: y["volume"],
+        reverse=True,
+    )
+]
+
+if (
+    len(frozen_compartment_sorted_by_volume) > 0
+    and len(unfrozen_compartment_sorted_by_volume) > 0
+):
+    compartments_used_for_period_selection = [
+        frozen_compartment_sorted_by_volume[0],
+        unfrozen_compartment_sorted_by_volume[0],
+    ]
+elif len(frozen_compartment_sorted_by_volume) > 0:
+    compartments_used_for_period_selection = frozen_compartment_sorted_by_volume[:2]
+elif len(unfrozen_compartment_sorted_by_volume) > 0:
+    compartments_used_for_period_selection = unfrozen_compartment_sorted_by_volume[:2]
+else:
+    raise ValueError("No compartments defined")
+
+print(f"{compartments_used_for_period_selection=}")
+
+
+gradient_temp_sensors = ["110 (C)", "206 (C)"]
+ambient_temp_sensors = ["205 (C)", "210 (C)", "204 (C)"]
+# ["110 (C)", "210 (C)", "206 (C)", "204 (C)"]
+all_temp_sensors = (
+    [*[x for y in [x["temp sensors"] for x in compartments.values()] for x in y]]
+    + gradient_temp_sensors
+    + ambient_temp_sensors
+)
+
+
+power_files = "power_meetdata_map/Auto_20260416143058_*"
+# temp_file = "temp_data_utf8.csv"
+# temp_file = "meting eind dec 2025/Data*.csv"
+temp_file = "temp_meetdata_map/Data 4_16_2026 14_31_15 1.csv"
+
+time_col: str = "Datetime"
+val_col: str = "P-1"
+val_col_smooth_long: str = "P-1_smooth_30_sec"
+val_col_smooth_short: str = "P-1_smooth_4_sec"
+duration_col: str = "duration_t"
+power_col: str = "P-1"
+
+ROUNDING_INTERVAL = 2.0  # watts for histogram binning when determining base/peak levels
+
+time_weighted_means_sensors = all_temp_sensors + [power_col]
+
+
+lf_power = (
+    pl.scan_csv(power_files, infer_schema=False)
+    .select(~cs.contains("duplicated"))
+    # Create Datetime and drop old cols in one select
+    .with_columns(
+        pl.format(
+            "{} {}.{}",
+            pl.col("Date"),
+            pl.col("Time"),
+            pl.col("Millisecond").cast(pl.String).str.pad_start(3, "0"),
+        )
+        .str.to_datetime("%Y/%m/%d %H:%M:%S.%3f")
+        .alias(time_col)
+    )
+    .drop(["Date", "Time", "Millisecond", "Store No."])
+    .with_columns(
+        cs.starts_with("WT1").str.strip_chars().replace("NAN", None).cast(pl.Float64)
+    )
+    .rename(lambda col: col.replace("WT1:", ""))
+    .drop_nulls()
+    .select([time_col, cs.all().exclude(time_col)])
+    .sort(time_col)
+)
+
+# 2. Define the Temp Pipeline
+lf_temp = (
+    pl.read_csv(temp_file, skip_rows=28, encoding="UTF-16", truncate_ragged_lines=True)
+    # pl.scan_csv(temp_file, skip_rows=18, encoding="UTF-16")
+    .lazy()
+    .drop("Scan")
+    .select(~cs.starts_with("Alarm"))
+    # By using .alias("Time"), we overwrite the original string column
+    # with the new datetime object in one step.
+    .with_columns(pl.col("Time").str.to_datetime("%d-%m-%Y %H:%M:%S:%3f"))
+    # Optionally rename it to "Datetime" if you prefer that label
+    .rename({"Time": time_col})
+    # Organize: Datetime first and sort chronologically
+    .select([time_col, cs.all().exclude(time_col)])
+    .sort(time_col)
+)
+
+# 3. Join and Process
+# We use a join_asof or full join depending on your alignment needs.
+# Since you used interpolate, a full join + coalesce is correct.
+df_meas_data = (
+    lf_power.join(lf_temp, on=time_col, how="full", coalesce=True)
+    .sort(time_col)
+    # interpolate using time column
+    .with_columns(cs.numeric().exclude(time_col).interpolate_by(pl.col(time_col)))
+    .with_columns(meas_duration=pl.col("Datetime").diff().shift(-1))
+    .drop_nulls()
+    # Semi-join acts as a filter to keep only timestamps present in power
+    .join(lf_power.select(time_col), on=time_col, how="semi")
+    .with_columns(pl.col(time_col).diff().shift(-1).alias(duration_col))
+    .filter(pl.col(duration_col).is_not_null())
+).collect()
+# df_meas_data.write_parquet("df_meas_data.parquet")
+# sys.exit(0)
+
+end_time = time()
+print(f"everything before smoothing filter took {end_time - start_time:.5f} seconds")
+
+mean_sampling_interval_seconds = (
+    df_meas_data.select(pl.col(duration_col)).mean().item().total_seconds()
+)
+sigma_seconds_long = 30  # seconds
+sigma_samples_long = int(sigma_seconds_long / mean_sampling_interval_seconds)
+sigma_seconds_short = 4  # seconds
+sigma_samples_short = int(sigma_seconds_short / mean_sampling_interval_seconds)
+
+# use a median filter to smooth the data
+start_time = time()
+df_meas_data_w_median = df_meas_data.with_columns(
+    pl.col("P-1")
+    .rolling_median(window_size=sigma_samples_short, center=True)
+    .alias(val_col_smooth_short),
+    pl.col("P-1")
+    .rolling_median(window_size=sigma_samples_long, center=True)
+    .alias(val_col_smooth_long),
+).slice(sigma_samples_long, df_meas_data.height - 2 * sigma_samples_long)
+print(f"median filter took {time() - start_time:.5f} seconds")
+
+# determine base and peak levels by making a histogram of the smoothed power data
+# and taking the two most common bins using a bin width of ROUNDING_INTERVAL
+# NOTE a more rigid approach could be to use the pybaselines package
+# NOTE maybe replace with CUSUM or PELT https://www.researchgate.net/figure/Pruned-exact-linear-time-PELT-algorithm-overview_fig1_317273871
+# https://external-content.duckduckgo.com/iu/?u=https%3A%2F%2Fwww.researchgate.net%2Fpublication%2F317273871%2Ffigure%2Ffig3%2FAS%3A614128532090880%401523431060027%2FOutlier-detection-by-pruned-exact-linear-time-time-series-Kalman-filter-PELT-TSKF_Q640.jpg&f=1&nofb=1&ipt=21834f5ab10471f42864a2244c4a40dfcde9c17e4a6f8036ed8a5eff98ef36ae
+# NOTE See plateau_detection.ipynb
+
+histogram = (
+    df_meas_data_w_median.select(
+        (
+            (pl.col(val_col_smooth_long) / ROUNDING_INTERVAL).floor()
+            * ROUNDING_INTERVAL
+        ).alias("rounded")
+    )  # compute rounded bin values and create "rounded" column
+    .group_by("rounded")  # group by rounded bin values
+    .len(name="count")  # count occurrences in each bin
+    # add half bin width to get bin centers
+    .with_columns(
+        (pl.col("rounded").cast(pl.Float32) + (ROUNDING_INTERVAL / 2)).alias(
+            "bin_center"
+        )
+    )
+)
+# histogram.write_parquet("histogram.parquet")
+
+# get the two most common bins
+base_level, peak_level = histogram.top_k(2, by="count")["bin_center"]
+# TODO remove magic numbers of 0.5 watt and 75 %
+# the 0.5 watt is to ensure that we are really looking at the "off" state for the base level and not a bin that includes some "on" values, and the 75% is to ensure that we are really looking at the "on" state for the peak level and not a bin that includes some "off" values
+# the 75% is somewhat arbitrary but it is to ensure that we are looking at a bin that is mostly "on" values for the peak level, and not a bin that includes a significant amount of "off" values
+activation = base_level + 0.75 * np.ptp(
+    df_meas_data_w_median.select(val_col_smooth_long).filter(
+        abs(pl.col(val_col_smooth_long).round(2) - base_level) < 0.5
+    )
+)
+
+# threshold = (base_level + peak_level) / 2
+threshold = base_level + 0.05 * (base_level + peak_level)
+
+# plot the power over time with base and peak levels indicated and plot the histogram next to it
+# aligning the power axis of the histogram with the power axis of the time series plot
+if DEBUG:
+    # fig, (ax1, ax2) = plt.subplots(figsize=(14, 6), ncols=2, sharey=True, gridspec_kw={"width_ratios": [5, 1]})
+    fig, (ax1, ax2) = plt.subplots(
+        figsize=(14, 6), ncols=2, sharey=True, gridspec_kw={"width_ratios": [5, 1]}
+    )
+
+    x = df_meas_data_w_median[time_col].to_list()
+    y = df_meas_data_w_median[val_col].to_list()
+    y_smooth = df_meas_data_w_median[val_col_smooth_long].to_list()
+
+    ax1.axhline(threshold, color="green", alpha=0.8, label="threshold")
+    ax1.plot(x, y, label=val_col)
+    ax1.plot(x, y_smooth, label=val_col_smooth_long)
+    ax1.set_title("power consumption over time with base and peak levels")
+    ax1.legend(title="Power Data")
+    ax1.set_xlim([min(x), max(x)])  # type: ignore
+    format_dates(fig, ax1)
+    ax1.axhline(
+        base_level,
+        color="red",
+        linestyle="dashdot",
+        label=f"Base Level: {base_level:.5f} W",
+    )
+    ax1.axhspan(
+        base_level - ROUNDING_INTERVAL / 2,
+        base_level + ROUNDING_INTERVAL / 2,
+        color="black",
+        alpha=0.1,
+    )
+    ax1.axhline(
+        peak_level,
+        color="black",
+        linestyle="solid",
+        label=f"Peak Level: {peak_level:.5f} W",
+    )
+    ax1.axhspan(
+        peak_level - ROUNDING_INTERVAL / 2,
+        peak_level + ROUNDING_INTERVAL / 2,
+        color="black",
+        alpha=0.1,
+    )
+    ax1.set_ylabel("Power (W)")
+    ax1.set_xlabel("Time")
+    ax1.legend()
+
+    ax2.barh(
+        y=histogram["bin_center"].to_list(),
+        width=histogram["count"].to_list(),
+        height=ROUNDING_INTERVAL * 0.9,
+        align="center",
+        left=0,
+    )
+    ax2.set_xlabel("Frequency")
+    ax2.set_title("Histogram")
+    ax2.set_xscale("log")
+    ax2.axhline(
+        base_level,
+        color="red",
+        linestyle="dashdot",
+        label=f"Base Level: {base_level:.5f} W",
+    )
+    ax2.axhline(
+        peak_level,
+        color="black",
+        linestyle="solid",
+        label=f"Peak Level: {peak_level:.5f} W",
+    )
+
+    plt.subplots_adjust(wspace=0.05)
+    plt.show()
+
+
+# with the threshold, segment the time series into temperature control cycles TCC
+# (a cycle of the compressor being on and off)
+# and filter out cycles that are shorter than 5 minutes to remove noise
+# first create a column that indicates when the compressor is on or off based on the threshold,
+# then find the transitions from off to on and from on to off,
+# and then filter out cycles that are shorter than 5 minutes
+# give each cycle a unique id and compute the start and end time of each cycle and the duration of each cycle
+# NOTE this approach assumes that the compressor is either fully on or fully off,
+# and that there are no intermediate states. If there are intermediate states,
+# a more complex approach may be needed to segment the cycles accurately.
+df_TCC = (
+    df_meas_data_w_median.select(
+        [
+            pl.col(time_col),
+            (pl.col(val_col_smooth_short) >= activation).cast(pl.Int32).alias("is_on"),
+        ]
+    )
+    .with_columns(pulse_transitions_pos_neg=pl.col("is_on").diff(-1))
+    .filter(pl.col("pulse_transitions_pos_neg") != 0)
+    .sort("pulse_transitions_pos_neg")
+    .with_columns(
+        time_diff_btwn_pulses_of_same_orientation=pl.col("Datetime").diff(1).shift(-1)
+    )
+    .filter(pl.col("time_diff_btwn_pulses_of_same_orientation") > timedelta(minutes=5))
+    .drop("time_diff_btwn_pulses_of_same_orientation", "pulse_transitions_pos_neg")
+    .sort("Datetime")
+    .filter(pl.col("is_on").diff(1) != 0)
+    .with_columns(pl.col("Datetime").shift(-1).alias("pulse_end_datetime"))
+    .rename({"Datetime": "TCC_start_datetime"})
+    .filter(pl.col("is_on") == 1)
+    .drop("is_on")
+    .with_row_index("TCC_id")
+    .with_columns(
+        TCC_duration=pl.col("TCC_start_datetime").diff().shift(-1),
+        TCC_end_datetime=pl.col("TCC_start_datetime").shift(-1),
+    )
+    .with_columns(
+        TCC_on_duration=pl.col("TCC_duration")
+        - (pl.col("pulse_end_datetime") - pl.col("TCC_start_datetime")),
+    )
+    .drop_nulls()
+)
+# df_TCC.write_parquet("df_TCC.parquet")
+
+# now let's join the TCC with the original data to get the temperature data for each cycle, and compute time-weighted means for each sensor for each cycle
+lf_meas_data_w_smooth_pre_TCC_join = df_meas_data_w_median.with_columns(
+    pl.col("Datetime").alias("bucket")
+).lazy()
+lf_TCC_pre_meas_data_join = df_TCC.with_columns(
+    pl.col("TCC_start_datetime").alias("bucket")
+).lazy()
+
+
+def weighted_mean_expr(col_name: str, weight_col: str) -> pl.Expr:
+    return (pl.col(col_name) * pl.col(weight_col)).sum() / pl.col(weight_col).sum()
+
+
+def weighted_time_accumulation_expr_hours(value_col: str, time_col: str) -> pl.Expr:
+    return (pl.col(value_col) * pl.col(time_col).dt.total_hours(fractional=True)).sum()
+
+
+start_time = time()
+# first we do a cross join to get all combinations of measurements and TCCs,
+# then we filter to keep only the measurements that fall within the start and end time of each TCC,
+# and then we compute the time-weighted means for each sensor for each TCC
+df_meas_data_w_smooth_w_TCC_id = (
+    lf_meas_data_w_smooth_pre_TCC_join.join(
+        lf_TCC_pre_meas_data_join, how="cross"
+    )  # small-ish cross within bucket
+    .filter(
+        pl.col("Datetime").is_between(
+            pl.col("TCC_start_datetime"), pl.col("TCC_end_datetime"), closed="both"
+        )
+    )
+    .select(
+        [
+            "Datetime",
+            "meas_duration",
+            "TCC_id",
+            "TCC_duration",
+            *time_weighted_means_sensors,
+        ]
+    )
+    .sort("Datetime")
+).collect()
+# df_meas_data_w_smooth_w_TCC_id.write_parquet("df_meas_data_w_smooth_w_TCC_id.parquet")
+
+
+df_TCC_w_streaks_and_individual_sensor_means = df_TCC.join(
+    (
+        df_meas_data_w_smooth_w_TCC_id.with_columns(is_defrost_cycle=pl.col("P-1") > 50)
+        .group_by("TCC_id")
+        .agg(
+            [
+                pl.any("is_defrost_cycle"),
+                *[
+                    weighted_mean_expr(s, "meas_duration")
+                    for s in time_weighted_means_sensors
+                ],
+            ]
+        )
+        .sort("TCC_id")
+        .with_columns(pl.col("is_defrost_cycle").cum_sum().alias("streak_id"))
+    ),
+    on="TCC_id",
+).sort("TCC_id")
+
+# ref A
+# TODO hier zit streaks niet meer in
+df_TCC_w_streaks_and_means = df_TCC_w_streaks_and_individual_sensor_means.with_columns(
+    [
+        pl.mean_horizontal([pl.col(s) for s in comp_details["temp sensors"]]).alias(
+            f"temp_mean_{comp}"
+        )
+        for comp, comp_details in [
+            *compartments.items(),
+            ("amb", {"temp sensors": ambient_temp_sensors}),
+        ]
+    ]
+)
+df_TCC_w_streaks_and_means.write_parquet("df_TCC_w_streaks_and_means.parquet")
+
+print(
+    f"TCC joining and weighted means computation took {time() - start_time:.5f} seconds"
+)
+
+if DEBUG:
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # plot all cycles and for each cycle color the background differently
+    cmap = plt.get_cmap("Pastel2")  # pyright: ignore[reportAttributeAccessIssue]
+    for idx, cycle in enumerate(df_TCC.iter_rows(named=True)):
+        ax.axvspan(
+            cycle["TCC_start_datetime"],
+            cycle["TCC_end_datetime"],
+            color=cmap(cycle["TCC_id"] % cmap.N),
+            alpha=0.5,
+        )
+
+    x = df_meas_data_w_median[time_col].to_list()
+
+    y = df_meas_data_w_median[val_col].to_list()
+    y_smooth = df_meas_data_w_median[val_col_smooth_short].to_list()
+
+    ax.axhline(threshold, color="green", alpha=0.8, label="threshold")
+    ax.plot(x, y, label=val_col, color="red", alpha=0.5)
+    ax.plot(x, y_smooth, label=f"{val_col_smooth_short}", color="k", alpha=0.5)
+    ax.set_title("Power Data with Detected Cycles")
+    ax.set_xlim([min(x), max(x)])  # type: ignore
+    format_dates(fig, ax)
+    ax.set_ylabel("Power (W)")
+    ax.set_xlabel("Time")
+    plt.show()
+
+
+# TODO merge this with ref A so that there is a central location for these names
+mean_temp_cols = [f"temp_mean_{comp}" for comp in compartments.keys()]
+mean_temp_cols_for_period_selection = [
+    f"temp_mean_{comp}" for comp in compartments_used_for_period_selection
+]
+
+
+def get_period_stats(block_a_df, block_b_df, block_c_df):
+    """ "Compute statistics for a given period defined by three blocks (A, B, C).
+    Each block represents a sequence of TCCs, and the function calculates various statistics
+    such as period duration, average temperatures, temperature spreads, temperature slopes,
+    power spread, power slope, power average, and steady-state compressor run time for the period.
+    The function assumes that the input dataframes contain the necessary columns for these
+    calculations and that they are structured in a way that allows for the computations to be
+    performed as described.
+
+    First, the function concatenates the three blocks of TCCs into a single dataframe and calculates
+    the total duration of the period by summing the durations of the individual blocks. It also calculates
+    the time duration between the midpoints of block A and block C, which is used for slope calculations.
+
+    Then it computes the time-weighted mean temperatures for each sensor across the entire period using
+    the provided weighted mean expression. It also calculates the temperature spread for the sensors
+    used in period selection by finding the difference between the maximum and minimum values across
+    the blocks. The temperature slopes are calculated by taking the difference in mean temperatures
+    between block C and block A and dividing by the time duration between their midpoints.
+
+    For power, it calculates the spread as the peak-to-peak value across the blocks, the slope as the
+    difference in mean power between block C and block A divided by the time duration, and the average
+    power across the period. It also computes the percentage spread and slope relative to the average power.
+    """
+    period_start_datetime = block_a_df["block_TCC_start_datetime"].item()
+
+    df_blocks = pl.concat([block_a_df, block_b_df, block_c_df])
+    df_blocks.write_parquet("df_blocks.parquet")
+
+    period_duration = df_blocks["block_duration"].sum()
+    a_c_time_duration = (
+        block_c_df["block_time_midpoint"] - block_a_df["block_time_midpoint"]
+    ).item().total_seconds() / 3600
+
+    temp_means = df_blocks.select(
+        [weighted_mean_expr(col, "block_duration") for col in mean_temp_cols]
+    )
+
+    temp_spreads = df_blocks.select(mean_temp_cols_for_period_selection).select(
+        (cs.numeric().max() - cs.numeric().min())
+    )
+    temp_slopes = (
+        block_c_df[mean_temp_cols_for_period_selection]
+        - block_a_df[mean_temp_cols_for_period_selection]
+    ) / a_c_time_duration
+
+    power_spread = np.ptp(df_blocks[power_col].to_numpy())
+    power_slope = (
+        block_c_df[power_col] - block_a_df[power_col]
+    ).item() / a_c_time_duration
+
+    power_avg = df_blocks.select(weighted_mean_expr(power_col, "block_duration")).item()
+    power_spread_pct = (power_spread / power_avg) * 100
+    power_slope_pct = (power_slope / power_avg) * 100
+
+    # steady state compressor run time the percentage of time that the compressor is on during the total time
+    period_compressor_on_duration = df_blocks["block_total_on_duration"].sum()
+    period_steady_state_compressor_run_time = (
+        period_compressor_on_duration / period_duration * 100
+    )
+
+    return {
+        "period_duration": period_duration,
+        **{col: val for col, val in zip(temp_means.columns, temp_means.row())},
+        **{
+            f"temp_spread_{col}": val
+            for col, val in zip(temp_spreads.columns, temp_spreads.row())
+        },
+        **{
+            f"temp_slope_{col}": val
+            for col, val in zip(temp_slopes.columns, temp_slopes.row())
+        },
+        "power_avg": power_avg,
+        "power_spread": power_spread,
+        "power_spread_pct": power_spread_pct,
+        "power_slope_pct": power_slope_pct,
+        "period_steady_state_compressor_run_time": period_steady_state_compressor_run_time,
+        "period_start_datetime": period_start_datetime,
+    }
+
+
+# now a period selecection algorithm that loops through all possible periods defined by three consecutive blocks of TCCs,
+#  where each block consists of k TCCs, and computes the statistics for each period using the get_period_stats function
+# defined above. The results are stored in a list of dictionaries, which is then converted to a dataframe for further analysis.
+# I think the ISO 16358-1 standard suggests to just loop through the periods and find the first one you find that meets the criteria for a steady state period, and then use that period for the rest of the analysis,
+# but since the data is already loaded and we have the get_period_stats function defined, it is not much more computationally expensive to compute the statistics for all possible periods and then filter for the desired periods based on the computed statistics,
+
+# the following list of references to columns is used in the loop below to compute the statistics
+# for each period defined by three consecutive blocks of TCCs, where each block consists of k TCCs.
+# By defining this list of expressions once, we can reuse it for each block without having to
+# rewrite the same expressions multiple times, which makes the code cleaner and more efficient.
+_relevant_cols = [
+    *[weighted_mean_expr(col, "TCC_duration") for col in mean_temp_cols],
+    weighted_mean_expr(power_col, "TCC_duration"),
+    pl.col("TCC_duration").sum().alias("block_duration"),
+    (
+        pl.col("TCC_start_datetime").min()
+        + (pl.col("TCC_end_datetime").max() - pl.col("TCC_start_datetime").min()) / 2
+    ).alias("block_time_midpoint"),
+    pl.col("TCC_on_duration").sum().alias("block_total_on_duration"),
+    pl.col("TCC_start_datetime").min().alias("block_TCC_start_datetime"),
+    pl.col("TCC_end_datetime").max().alias("block_TCC_end_datetime"),
+]
+
+start_time = time()
+all_stats_list = []
+for streak_id in df_TCC_w_streaks_and_means.unique("streak_id")["streak_id"].to_list():
+    print(f"now doing {streak_id=}")
+    df_TCC_w_sam_slice = df_TCC_w_streaks_and_means.filter(
+        pl.col("streak_id") == streak_id
+    )
+    # remove the first two and last TCC since they are likely part of a defrost cycle
+    df_TCC_w_sam_slice = df_TCC_w_sam_slice.sort("TCC_id").slice(
+        2, df_TCC_w_sam_slice.height - 3
+    )
+
+    # the stats_cache is a dictionary that stores the computed statistics for each block of TCCs,
+    #  so that we don't have to recompute the same statistics multiple times when they are used in multiple periods.
+    #  The key of the dictionary is a tuple of (start_TCC_id, k),
+    #  where start_TCC_id is the id of the first TCC in the block and k is the number of TCCs in the block.
+    #  The value of the dictionary is the dataframe with the computed statistics for that block of TCCs.
+    stats_cache = {}
+
+    min_TCC_id, max_TCC_id = (
+        df_TCC_w_sam_slice["TCC_id"].min(),
+        df_TCC_w_sam_slice["TCC_id"].max(),
+    )
+    for start_TCC_id in range(min_TCC_id, max_TCC_id - 2):  # type: ignore
+        # k = number of TCC per block
+        max_k: int = ((max_TCC_id - start_TCC_id + 1) - 2) // 3  # type: ignore
+        for k in range(1, max_k):
+            s: int = start_TCC_id - min_TCC_id  # type: ignore
+
+            if (start_TCC_id, k) not in stats_cache:
+                stats_cache[(start_TCC_id, k)] = df_TCC_w_sam_slice.slice(s, k).select(
+                    _relevant_cols
+                )
+            if (start_TCC_id + k, k) not in stats_cache:
+                stats_cache[(start_TCC_id + k, k)] = df_TCC_w_sam_slice.slice(
+                    s + k, k
+                ).select(_relevant_cols)
+            if (start_TCC_id + 2 * k, k) not in stats_cache:
+                stats_cache[(start_TCC_id + 2 * k, k)] = df_TCC_w_sam_slice.slice(
+                    s + 2 * k, k
+                ).select(_relevant_cols)
+
+            # Compute stats for primary period and for the previous periods
+            blocks_in_curr_period = [
+                stats_cache[(start_TCC_id, k)],
+                stats_cache[(start_TCC_id + k, k)],
+                stats_cache[(start_TCC_id + 2 * k, k)],
+            ]
+            stats = get_period_stats(*blocks_in_curr_period)
+            stats["streak_id"] = streak_id
+            stats["id"] = (start_TCC_id, k)
+            stats["start_TCC_id"] = start_TCC_id
+            stats["N_TCC_per_block"] = k
+            all_stats_list.append(stats)
+
+
+# convert the all_stats_list to a dataframe
+df_all_possible_periods_w_stats = pl.from_dicts(
+    all_stats_list,
+    infer_schema_length=1,
+    schema_overrides={
+        "period_duration": pl.Duration("ms"),
+        "period_start_datetime": pl.Datetime("ms"),
+    },
+)
+print(f"Period stat computations took {time() - start_time:.5f} seconds")
+# print(df_all_possible_periods_w_stats.columns)
+
+
+start_time = time()
+# filter for ss1 using criteria from ISO 16358 standard
+ss1_candidates = (
+    (
+        df_all_possible_periods_w_stats.filter(
+            pl.col("period_duration") >= timedelta(hours=6)
+        )
+        .filter(pl.all_horizontal(cs.starts_with("temp_spread") < 0.25))
+        .filter(
+            (
+                pl.when(pl.col("period_duration") <= timedelta(hours=12))
+                .then(pl.col("power_spread_pct") <= 1)
+                .when(
+                    (pl.col("period_duration") > timedelta(hours=12))
+                    & (pl.col("period_duration") < timedelta(hours=36))
+                )
+                .then(
+                    pl.col("power_spread_pct")
+                    <= (
+                        1
+                        + (
+                            (pl.col("period_duration").dt.total_seconds() / 3600 - 12)
+                            / 1200
+                        )
+                    )
+                )
+                .otherwise(pl.col("power_spread_pct") <= 3)
+            )
+        )
+        .filter(pl.col("power_slope_pct").abs() < 0.25)
+    )
+    # determine if periods that start 1 tcc and 2 tcc earlier are also valid
+    .sort(["N_TCC_per_block", "start_TCC_id"])
+    .with_columns(
+        # shift the previous two rows of s and compare if they are equal to the s of the current row minus 1 and minus 2
+        prev_two_periods_also_valid=(
+            pl.col("start_TCC_id")
+            == (
+                pl.col("start_TCC_id")
+                .shift(1)
+                .over("N_TCC_per_block")
+                .over("streak_id")
+                + 1
+            )
+        )
+        & (
+            pl.col("start_TCC_id")
+            == (
+                pl.col("start_TCC_id")
+                .shift(2)
+                .over("N_TCC_per_block")
+                .over("streak_id")
+                + 2
+            )
+        )
+    )
+    .filter(pl.col("prev_two_periods_also_valid"))
+).sort("power_spread")
+# ss1_candidates.write_parquet("ss1_candidates.parquet")
+# print(ss1_candidates)
+opti = ss1_candidates.row(0, named=True)
+
+
+print(f"ss11 filtering took {time() - start_time:.5f} seconds")
+mean_amb_temp = df_TCC_w_streaks_and_means.select(
+    weighted_mean_expr("temp_mean_amb", "TCC_duration")
+).item()
+print(f"{mean_amb_temp = }")
+# TODO uitzoeken wanneer delta_cop een andere factor wordt
+delta_cop = 0.00  # per degree C
+c1 = 0.011364
+c2 = 1.25
+pss1 = opti["power_avg"]
+target_ambient_temp = 16
+
+teller = sum(
+    compartments[compartment]["volume"]
+    / (c1 * (18 + compartments[compartment]["target_temp"]) + c2)
+    for compartment in compartments.keys()
+)
+noemer = sum(
+    (
+        compartments[compartment]["volume"]
+        * (mean_amb_temp - opti[f"temp_mean_{compartment}"])
+    )
+    / (c1 * (18 + compartments[compartment]["target_temp"]) + c2)
+    for compartment in compartments.keys()
+)
+
+print(f"{pss1 = }")
+pss = pss1 * (
+    1
+    + (
+        (target_ambient_temp - mean_amb_temp)
+        / (1 + (target_ambient_temp - mean_amb_temp) * delta_cop)
+    )
+    * teller
+    / noemer
+)
+print(f"{pss = }")
+
+start_time = time()
+
+df_defrost_cycles = (
+    df_TCC_w_streaks_and_means.filter("is_defrost_cycle")
+    .select("streak_id", "TCC_start_datetime", "TCC_end_datetime")
+    .with_columns(
+        (pl.col("TCC_start_datetime") + pl.lit(timedelta(hours=2))).alias(
+            "nominal_center"
+        )
+    )
+    .with_columns(
+        (pl.col("nominal_center") - pl.lit(timedelta(hours=3))).alias("D_border"),
+        (pl.col("nominal_center") + pl.lit(timedelta(hours=3))).alias("F_border"),
+    )
+)
+
+# TODO dit klopt nog niet helemaal, zie pag. 45 van norm a.k.a. eq. 26
+# delta_t_df: defrost interval (td-f) — time between consecutive defrost cycle starts, in hours
+delta_t_df = (
+    df_defrost_cycles.with_columns(
+        pl.col("TCC_start_datetime")
+        .diff()
+        .dt.total_hours(fractional=True)
+        .alias("delta_t_defrost_h")
+    )
+    .select(
+        ["streak_id", "TCC_start_datetime", "TCC_end_datetime", "delta_t_defrost_h"]
+    )
+    .drop_nulls()  # first row has no previous defrost, so no interval
+)
+print("Defrost intervals (td-f) in hours:")
+print(delta_t_df)
+print()
+
+
+df_all_possible_periods_w_stats_pre_df1_filter = (
+    df_all_possible_periods_w_stats.filter(pl.col("N_TCC_per_block") >= 3)
+    .filter(pl.col("period_duration") > timedelta(hours=3))
+    .filter(pl.all_horizontal(cs.starts_with("temp_spread") < 0.5))
+    .filter((pl.col("power_spread") < 1) | (pl.col("power_spread_pct") < 2))
+)
+
+
+# TODO I think this might break if the first TCC is a defrost cycle...
+for idx, defrost_cycle_row in enumerate(df_defrost_cycles.iter_rows(named=True)):
+    post_defrost_streak_id = defrost_cycle_row["streak_id"]
+    pre_defrost_streak_id = post_defrost_streak_id - 1
+
+    df_D = (
+        df_all_possible_periods_w_stats_pre_df1_filter.filter(
+            pl.col("streak_id") == pre_defrost_streak_id
+        )
+        .select(
+            [
+                "period_duration",
+                "power_spread",
+                "N_TCC_per_block",
+                "start_TCC_id",
+                "period_start_datetime",
+            ]
+        )
+        .rename(
+            {
+                "period_duration": "D_period_duration",
+                "power_spread": "D_power_spread",
+                "start_TCC_id": "D_start_TCC_id",
+                "period_start_datetime": "D_period_start_datetime",
+            }
+        )
+    )
+
+    df_F = (
+        df_all_possible_periods_w_stats_pre_df1_filter.filter(
+            pl.col("streak_id") == post_defrost_streak_id
+        )
+        .select(
+            [
+                "period_duration",
+                "power_spread",
+                "N_TCC_per_block",
+                "start_TCC_id",
+                "period_start_datetime",
+            ]
+        )
+        .rename(
+            {
+                "period_duration": "F_period_duration",
+                "power_spread": "F_power_spread",
+                "start_TCC_id": "F_start_TCC_id",
+                "period_start_datetime": "F_period_start_datetime",
+            }
+        )
+    )
+
+    start_valid_D = df_D.select("D_period_start_datetime").min().item() + timedelta(
+        hours=5
+    )
+    end_valid_D = defrost_cycle_row["D_border"]
+
+    start_valid_F = defrost_cycle_row["F_border"]
+
+    df_D = df_D.filter(
+        pl.col("D_period_start_datetime").is_between(
+            start_valid_D, end_valid_D, closed="both"
+        )
+    )
+    # df_F = df_F.filter(pl.col("period_start_datetime").is_between(start_valid_F, end_valid_F, closed="both"))
+    df_F = df_F.filter(pl.col("F_period_start_datetime") >= start_valid_F)
+
+    optimal_combinations_of_D_and_F_periods = (
+        df_D.join(df_F, on="N_TCC_per_block", how="inner")
+        .filter(
+            (pl.col("D_period_duration") / pl.col("F_period_duration")).is_between(
+                0.8, 1.25, closed="both"
+            )
+        )
+        .with_columns(
+            combined_power_spread=pl.col("D_power_spread") + pl.col("F_power_spread")
+        )
+        .sort("combined_power_spread")
+        # .sort("N_TCC_per_block",descending=True)
+    )
+
+    opti = optimal_combinations_of_D_and_F_periods.row(0, named=True)
+    # first compute the accumulted energy
+    delta_E_accum_wh = (
+        df_TCC_w_streaks_and_means.filter(
+            pl.col("TCC_id").is_between(
+                opti["D_start_TCC_id"],
+                opti["F_start_TCC_id"] + 3 * opti["N_TCC_per_block"],
+                closed="both",
+            )
+        )
+        .select(weighted_time_accumulation_expr_hours(power_col, "TCC_duration"))
+        .item()
+    )  # in Watt h
+
+    # now the difference in avera power consumption
+    P_SS_D = (
+        df_TCC_w_streaks_and_means.filter(
+            pl.col("TCC_id").is_between(
+                opti["D_start_TCC_id"],
+                opti["D_start_TCC_id"] + 3 * opti["N_TCC_per_block"],
+                closed="both",
+            )
+        )
+        .select(weighted_mean_expr(power_col, "TCC_duration"))
+        .item()
+    )  # in Watt
+    P_SS_F = (
+        df_TCC_w_streaks_and_means.filter(
+            pl.col("TCC_id").is_between(
+                opti["F_start_TCC_id"],
+                opti["F_start_TCC_id"] + 3 * opti["N_TCC_per_block"],
+                closed="both",
+            )
+        )
+        .select(weighted_mean_expr(power_col, "TCC_duration"))
+        .item()
+    )  # in Watt
+
+    t_start_D = opti["D_period_start_datetime"]
+    t_end_F = opti["F_period_start_datetime"] + opti["F_period_duration"]
+    delta_time_h = (t_end_F - t_start_D).total_seconds() / 60 / 60
+
+    Delta_E_dfj_wh = delta_E_accum_wh - delta_time_h * (P_SS_D + P_SS_F) / 2
+    print("=========================")
+    print(f"{Delta_E_dfj_wh = }")
+    print("=========================")
+
+    if DEBUG3:
+        t, p = (
+            df_meas_data_w_smooth_w_TCC_id["Datetime"][::100],
+            df_meas_data_w_smooth_w_TCC_id[power_col][::100],
+        )
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.axvspan(start_valid_D, end_valid_D, label="D", color="black", alpha=0.1)
+        ax.axvspan(start_valid_F, max(t), label="F", color="black", alpha=0.1)
+        ax.axvline(
+            defrost_cycle_row["nominal_center"],
+            label="nominal_center",
+            color="red",
+            linestyle="dashdot",
+        )
+
+        opti = optimal_combinations_of_D_and_F_periods.row(0, named=True)
+
+        ax.axvspan(
+            opti["D_period_start_datetime"],
+            opti["D_period_start_datetime"] + opti["D_period_duration"],
+            label="D",
+            color="black",
+            alpha=0.1,
+        )
+        ax.axvspan(
+            opti["F_period_start_datetime"],
+            opti["F_period_start_datetime"] + opti["F_period_duration"],
+            label="D",
+            color="black",
+            alpha=0.1,
+        )
+
+        ax.plot(t, p)
+
+        ax.set_xlim([min(t), max(t)])  # type: ignore
+        format_dates(fig, ax)
+        ax.set_ylabel("Power (W)")
+        ax.set_xlabel("Time")
+        # ax.legend(title="Power Data")
+        plt.show()
+
+print(f"df1 filtering took {time() - start_time:.5f} seconds")
+
+daily_energy_consumption_at_this_temp = (
+    0.001 * 24 * (pss + Delta_E_dfj_wh / delta_t_df["delta_t_defrost_h"].mean())  # type: ignore
+)
+
+# the average time it takes for a cycle in
+cycle_time_seconds = df_TCC.select(pl.col("TCC_duration")).mean().item().total_seconds()
+
+# the average time in each cycle that the compressor is on during steady state
+running_time_percentage = (
+    df_TCC_w_streaks_and_means.select(
+        pl.col("TCC_on_duration") / pl.col("TCC_duration")
+    )
+    .mean()
+    .item()
+) * 100
+
+print(
+    f"Estimated daily energy consumption at {target_ambient_temp}°C: {daily_energy_consumption_at_this_temp} kWh/day"
+)
+print(f"Average cycle time: {cycle_time_seconds} seconds")
+print(
+    f"Average percentage of time compressor is on during steady state: {running_time_percentage:.1f}%"
+)

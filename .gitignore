@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+
+# Meetdata (te groot voor GitHub)
+power_meetdata_map/
+power_meetdata_mapx/
+temp_meetdata_map/
+temp_meetdata_mapx/
+
+# Tussentijdse analysebestanden
+*.parquet
+*.png
+
+# Auteursrechtelijk beschermde norm
+EN 62552-3_2020.pdf
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<title>Documentatie koelkastanalyse EN 62552-3</title>
+<style>
+  :root {
+    --ink: #1a2332;
+    --muted: #4b5563;
+    --line: #d7dde5;
+    --bg: #f6f8fb;
+    --card: #ffffff;
+    --accent: #1d4e89;
+    --accent2: #0f766e;
+    --warn: #9a3412;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", Calibri, Arial, sans-serif;
+    color: var(--ink);
+    line-height: 1.45;
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 32px 28px 72px;
+    background: var(--bg);
+  }
+  h1, h2, h3, h4 { color: var(--accent); page-break-after: avoid; }
+  h1 { font-size: 1.85rem; border-bottom: 3px solid var(--accent); padding-bottom: .35em; }
+  h2 { font-size: 1.35rem; margin-top: 2.2em; border-bottom: 1px solid var(--line); padding-bottom: .2em; }
+  h3 { font-size: 1.12rem; margin-top: 1.5em; color: #16365c; }
+  p, li { color: var(--ink); }
+  .lead { font-size: 1.05rem; color: var(--muted); }
+  .meta { color: var(--muted); font-size: .92rem; }
+  nav {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin: 1.4em 0 2em;
+  }
+  nav a { color: var(--accent); text-decoration: none; }
+  nav a:hover { text-decoration: underline; }
+  nav ol { margin: .4em 0 0; padding-left: 1.3em; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    background: var(--card);
+    margin: .8em 0 1.3em;
+    font-size: .93rem;
+  }
+  th, td {
+    border: 1px solid var(--line);
+    padding: 7px 9px;
+    vertical-align: top;
+    text-align: left;
+  }
+  th { background: #e8eef6; color: #16365c; }
+  code, .mono { font-family: Consolas, "Courier New", monospace; font-size: .92em; }
+  pre {
+    background: #15202b;
+    color: #e6edf3;
+    padding: 12px 14px;
+    overflow-x: auto;
+    border-radius: 6px;
+    font-size: .84rem;
+    line-height: 1.4;
+  }
+  .box {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-left: 5px solid var(--accent);
+    padding: 12px 16px;
+    margin: 1em 0;
+    border-radius: 0 8px 8px 0;
+  }
+  .box.warn { border-left-color: var(--warn); }
+  .box.ok { border-left-color: var(--accent2); }
+  .flow {
+    display: grid;
+    gap: 8px;
+    margin: 1em 0;
+  }
+  .step {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 14px;
+  }
+  .step b { color: var(--accent); }
+  .arrow { text-align: center; color: var(--muted); font-size: 1.2rem; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media print {
+    body { background: white; max-width: none; }
+    nav { break-inside: avoid; }
+    a { color: inherit; text-decoration: none; }
+    .step, table, .box { break-inside: avoid; }
+  }
+  @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+  .entity { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--card); }
+  .entity h4 { margin: 0; padding: 8px 12px; background: #16365c; color: white; font-size: .95rem; }
+  .entity ul { margin: 0; padding: 8px 12px 10px 28px; }
+  .formula { font-family: Cambria, "Times New Roman", serif; font-size: 1.05rem; text-align: center; margin: .8em 0; }
+</style>
+</head>
+<body>
+
+<h1>Koelkastanalyse volgens EN 62552-3</h1>
+<p class="lead">
+Uitleg van de programmastructuur, het datamodel en wat elk stuk code doet.
+Dit document hoort bij de Python-code in deze map.
+</p>
+<p class="meta">Versie bij de campagne-GUI (Streamlit) met interpolatie onder/boven target en CRT-schatting uit metingen. Te openen in de browser of in Word via Bestand → Openen.</p>
+
+<nav>
+  <strong>Inhoud</strong>
+  <ol>
+    <li><a href="#doel">Doel van het programma</a></li>
+    <li><a href="#bestanden">Bestanden</a></li>
+    <li><a href="#datamodel">Datamodel</a></li>
+    <li><a href="#pipeline">Hoofdpijplijn</a></li>
+    <li><a href="#main">main.py — één meting analyseren</a></li>
+    <li><a href="#en">en62552.py — campagne, interpolatie, jaarverbruik</a></li>
+    <li><a href="#app">app.py — grafische interface</a></li>
+    <li><a href="#formules">Formules uit de norm</a></li>
+    <li><a href="#beperkingen">Aannames en beperkingen</a></li>
+  </ol>
+</nav>
+
+<h2 id="doel">1. Doel van het programma</h2>
+<p>
+Het programma bepaalt het energieverbruik van een koelapparaat (koelkast, diepvries of combinatie)
+volgens <strong>EN 62552-3</strong> (IEC 62552-3). Dat is niet één meting, maar een <em>campagne</em>:
+meerdere tests bij twee omgevingstemperaturen en twee thermostaatstanden, daarna interpolatie naar
+de doeltemperaturen, en tot slot een Europees jaarverbruik.
+</p>
+<div class="box ok">
+  <strong>Wat er uit moet komen</strong>
+  <ul>
+    <li><code>Edaily,16</code> — dagverbruik (kWh/d) bij 16 °C omgeving, bij de doeltemperaturen van de compartimenten</li>
+    <li><code>Edaily,32</code> — hetzelfde bij 32 °C omgeving</li>
+    <li><code>E_total</code> — jaarverbruik EU: 182,5 × Edaily,16 + 182,5 × Edaily,32 (kWh/jaar)</li>
+  </ul>
+</div>
+<p>
+Per losse meting gebeurt het zware rekenwerk in <code>main.py</code>: ruwe CSV’s omzetten in compressorcycli,
+een steady-state-periode kiezen, en extra ontdooi-energie bepalen. <code>en62552.py</code> combineert die
+meetpunten. <code>app.py</code> is de bediening.
+</p>
+
+<h2 id="bestanden">2. Bestanden</h2>
+<table>
+  <tr>
+    <th>Bestand</th>
+    <th>Rol</th>
+  </tr>
+  <tr>
+    <td><code>main.py</code></td>
+    <td>Signaalverwerking van <em>één</em> testrun: laden, TCC’s, SS1, ΔEdf. Bevat ook plotfuncties en de commando-regel-entry <code>if __name__ == "__main__"</code>.</td>
+  </tr>
+  <tr>
+    <td><code>en62552.py</code></td>
+    <td>Normlogica bovenop die ene run: doeltemperaturen, TestPoint, CRT-classificatie, interpolatie E.3, jaarverbruik, campagnestatus.</td>
+  </tr>
+  <tr>
+    <td><code>app.py</code></td>
+    <td>Streamlit-GUI: toestelconfiguratie, vier (of meer) meetpunten, knoppen om te analyseren, grafieken, interpolatie en export naar JSON.</td>
+  </tr>
+  <tr>
+    <td><code>power_meetdata_map/</code></td>
+    <td>Vermogenslogger-CSV’s (kolommen Date, Time, Millisecond, P-1, …).</td>
+  </tr>
+  <tr>
+    <td><code>temp_meetdata_map/</code></td>
+    <td>Temperatuur-CSV (UTF-16, kopregels overslaan, sensoren zoals <code>105 (C)</code>).</td>
+  </tr>
+</table>
+
+<h2 id="datamodel">3. Datamodel</h2>
+<p>
+Er zijn drie niveaus: het <strong>toestel</strong> (wat je test), de <strong>campagne</strong> (welke tests je doet),
+en de <strong>tijdreeksen</strong> binnen één test (cycli en perioden).
+</p>
+
+<h3>3.1 Overzicht</h3>
+<pre>
+Toestel
+  └─ Compartiment[]          naam, type (Tabel 1), volume, sensors, target
+  └─ Omgevingssensoren
+  └─ Gradiëntsensoren
+
+Campagne (Streamlit session / JSON)
+  └─ Meetpunt[]              Tamb 16 of 32 °C, knop onder of boven target, bestandspaden
+       └─ TestPoint          resultaat na analyse (Pss, temperaturen, ΔEdf, …)
+       └─ tcrt_hours[]       gemeten compressor-aan-tijd tussen ontdooiingen
+       └─ elapsed_hours[]    kloktijd tussen ontdooiingen
+
+Eén meting (Polars-tabellen)
+  └─ lf_meas_data            gesynchroniseerde power + temperatuur, per sample
+  └─ df_TCC                  één rij per compressorcyclus
+  └─ df_TCC_w_streaks_and_means   cyclus + temperaturen + is_defrost + streak_id
+  └─ df_all_possible_periods_w_stats   kandidaat-perioden (3 blokken van k TCC’s)
+  └─ ss1_opti                gekozen steady-state-periode
+</pre>
+
+<h3>3.2 Toestel en compartiment</h3>
+<p>
+Een compartiment is een fysieke ruimte in het apparaat. De GUI slaat rijen op als tabel;
+<code>apply_appliance_config()</code> zet ze om naar het woordenboek dat <code>main.py</code> gebruikt.
+</p>
+<div class="grid2">
+  <div class="entity">
+    <h4>GUI-rij (compartments_df)</h4>
+    <ul>
+      <li><code>name</code> — vrije naam, bv. fridge</li>
+      <li><code>table_type</code> — type uit Tabel 1 van de norm</li>
+      <li><code>volume</code> — inhoud in liter (invoer, niet gemeten)</li>
+      <li><code>sensors</code> — kommagescheiden kolomnamen</li>
+    </ul>
+  </div>
+  <div class="entity">
+    <h4>main.compartments[naam]</h4>
+    <ul>
+      <li><code>temp sensors</code> — lijst kolomnamen</li>
+      <li><code>volume</code> — liter</li>
+      <li><code>compartment type</code> — frozen of unfrozen</li>
+      <li><code>target_temp</code> — doel °C uit Tabel 1</li>
+      <li><code>table_type</code> — oorspronkelijk Tabel-1-type</li>
+    </ul>
+  </div>
+</div>
+<p>
+Doeltemperaturen komen uit <code>en62552.COMPARTMENT_TARGETS_C</code>, bijvoorbeeld Fresh food = 4 °C,
+Three-star = −18 °C. Frozen/unfrozen bepaalt welke compartimenten de steady-state-periode
+mogen “kiezen” (grootste frozen + grootste unfrozen).
+</p>
+<table>
+  <tr><th>Tabel-1-type</th><th>Target (°C)</th><th>Klasse in de code</th></tr>
+  <tr><td>Pantry</td><td>17</td><td>unfrozen</td></tr>
+  <tr><td>Wine storage / Cellar</td><td>12</td><td>unfrozen</td></tr>
+  <tr><td>Fresh food</td><td>4</td><td>unfrozen</td></tr>
+  <tr><td>Chill</td><td>2</td><td>unfrozen</td></tr>
+  <tr><td>Zero-star</td><td>0</td><td>frozen</td></tr>
+  <tr><td>One-star</td><td>−6</td><td>frozen</td></tr>
+  <tr><td>Two-star</td><td>−12</td><td>frozen</td></tr>
+  <tr><td>Three-star / Four-star</td><td>−18</td><td>frozen</td></tr>
+</table>
+
+<h3>3.3 Meetpunt (campagne)</h3>
+<p>
+Een meetpunt is één laboratoriumtest: één omgevingstemperatuur, één (ongeveer ingestelde) knopstand,
+en een set bestanden. De exacte thermostatwaarde is vaak onbekend (draaiknop zonder schaal);
+<code>vs_target</code> is daarom alleen <code>onder</code> of <code>boven</code> de doeltemperatuur.
+</p>
+<table>
+  <tr><th>Veld</th><th>Betekenis</th></tr>
+  <tr><td><code>id</code>, <code>name</code></td><td>Identificatie in de GUI</td></tr>
+  <tr><td><code>ambient_c</code></td><td>Nominale omgeving: 16 of 32 °C</td></tr>
+  <tr><td><code>vs_target</code></td><td><code>onder</code> = knop kouder dan target; <code>boven</code> = warmer</td></tr>
+  <tr><td><code>power_glob</code></td><td>Bestandspatroon voor vermogens-CSV’s</td></tr>
+  <tr><td><code>temp_file</code></td><td>Pad naar temperatuur-CSV</td></tr>
+  <tr><td><code>point</code></td><td><code>None</code> tot de analyse klaar is; daarna een dict van TestPoint</td></tr>
+  <tr><td><code>tcrt_hours</code></td><td>Gemeten compressor-run-time per ontdooi-interval (uren)</td></tr>
+  <tr><td><code>elapsed_hours</code></td><td>Kloktijd tussen ontdooi-starts (uren)</td></tr>
+  <tr><td><code>n_defrost_events</code></td><td>Aantal ontdooi-events in deze run</td></tr>
+  <tr><td><code>vs_target_warning</code></td><td>Tekst als knop-label en gemeten T niet bij elkaar passen</td></tr>
+</table>
+<p>
+Voor interpolatie zijn per omgeving <em>beide</em> kanten nodig: minstens één geanalyseerd punt
+<code>onder</code> en één <code>boven</code>. Standaard staan er daarom vier lege meetpunten klaar
+(16 onder, 16 boven, 32 onder, 32 boven).
+</p>
+
+<h3>3.4 TestPoint — resultaat van één meting</h3>
+<p>
+Dataclass in <code>en62552.py</code>. Dit is het compacte “energierapport” van een run, zonder de ruwe tijdreeksen.
+</p>
+<table>
+  <tr><th>Veld</th><th>Eenheid</th><th>Bron</th></tr>
+  <tr><td><code>name</code>, <code>ambient_c</code>, <code>vs_target</code></td><td>—</td><td>campagne-invoer</td></tr>
+  <tr><td><code>pss_w</code></td><td>W</td><td>SS1-vermogen, gecorrigeerd naar nominale Tamb (Annex B)</td></tr>
+  <tr><td><code>temps_c</code></td><td>°C per compartiment</td><td>tijdgewogen gemiddelde in de SS1-periode</td></tr>
+  <tr><td><code>crt_ss_pct</code></td><td>%</td><td>aandeel compressor-aan in SS1 (CRtSS)</td></tr>
+  <tr><td><code>delta_edf_wh</code></td><td>Wh</td><td>extra energie van ontdooi + herstel (Annex C)</td></tr>
+  <tr><td><code>delta_tdf_h</code></td><td>h</td><td>ontdooi-interval; uit gemeten Δtrt en formule 26, of None als er geen defrost is</td></tr>
+  <tr><td><code>mean_amb_c</code></td><td>°C</td><td>gemeten gemiddelde omgeving tijdens de run</td></tr>
+  <tr><td><code>edaily_wh</code> (berekend)</td><td>Wh/d</td><td>24·Pss, plus 24·ΔEdf/Δtdf als er een interval is</td></tr>
+</table>
+
+<h3>3.5 Tijdreeksen binnen één meting</h3>
+
+<h4>Sample (lf_meas_data)</h4>
+<p>
+Eén rij per tijdstip van de vermogenslogger. Temperatuur is erop gezet en in de tijd geïnterpoleerd.
+Belangrijke kolommen: <code>Datetime</code>, <code>P-1</code> (vermogen), sensoren zoals <code>105 (C)</code>,
+<code>meas_duration</code> (duur tot de volgende sample).
+</p>
+
+<h4>TCC — Temperature Control Cycle (df_TCC)</h4>
+<p>
+Eén rij = één compressor-aan/uit-cyclus: van het begin van een “aan”-puls tot het begin van de volgende.
+</p>
+<table>
+  <tr><th>Kolom</th><th>Betekenis</th></tr>
+  <tr><td><code>TCC_id</code></td><td>Volgnummer</td></tr>
+  <tr><td><code>TCC_start_datetime</code></td><td>Start van compressor-aan</td></tr>
+  <tr><td><code>pulse_end_datetime</code></td><td>Einde van compressor-aan (start van de pauze)</td></tr>
+  <tr><td><code>TCC_end_datetime</code></td><td>Start van de volgende cyclus</td></tr>
+  <tr><td><code>TCC_duration</code></td><td>Totale cyclusduur (aan + uit)</td></tr>
+  <tr><td><code>TCC_on_duration</code></td><td>Alleen de aan-tijd</td></tr>
+</table>
+
+<h4>TCC met temperaturen en defrost (df_TCC_w_streaks_and_means)</h4>
+<p>
+Zelfde cycli, plus:
+</p>
+<ul>
+  <li><code>temp_mean_&lt;compartiment&gt;</code> — rekenkundig gemiddelde van de sensors in dat compartiment, tijdgewogen over de cyclus</li>
+  <li><code>temp_mean_amb</code> — gemiddelde omgevingssensors</li>
+  <li><code>P-1</code> — tijdgewogen gemiddeld vermogen in de cyclus</li>
+  <li><code>is_defrost_cycle</code> — waar als er in de cyclus een vermogen &gt; 50 W voorkomt (ontdooiverwarming)</li>
+  <li><code>streak_id</code> — loopt op bij elke defrost-cyclus; alle gewone cycli ná een defrost delen hetzelfde nummer tot de volgende defrost. Zo groepeert de code “stabiele stukken tussen ontdooiingen”.</li>
+</ul>
+
+<h4>Periode (kandidaat voor SS1 of D/F)</h4>
+<p>
+Een periode is <strong>drie opeenvolgende blokken</strong> van elk <code>k</code> TCC’s. De code probeert alle
+startposities en alle k, en berekent per periode o.a. duur, gemiddelde temperaturen, spreads, vermogenshelling
+en CRtSS. SS1 is de geldige periode die het <em>vroegst eindigt</em>
+(minimaal 6 uur, kleine temperatuurspread, beperkt vermogensverloop): de kortste tijd
+vanaf de start van de meting tot een complete SS1. Bij gelijke eindtijd: kleinste
+<code>n</code>, daarna kortste duur. Doel is te bepalen of er lang genoeg gemeten is.
+D- en F-perioden zijn vergelijkbare stabiele stukken net vóór (Departure) en ná (Finish)
+een ontdooiing, voor ΔEdf.
+</p>
+
+<h3>3.6 Relatie tussen de objecten</h3>
+<pre>
+Campagne
+   │  configure_appliance()
+   ▼
+Toestel.compartments  ─────────────────────────────┐
+   │                                               │ sensors, volumes, targets
+   │  per Meetpunt: load → TCC → SS1 → defrost     │
+   ▼                                               ▼
+df_TCC_w_streaks_and_means ──► ss1_opti, pss, ΔEdf, tcrt
+   │
+   ▼
+TestPoint (Pss, T_i, CRtSS, ΔEdf)
+   │  twee punten zelfde Tamb: onder × boven
+   ▼
+InterpolationResult  →  Edaily,16  en  Edaily,32
+   │
+   ▼
+E_total  (jaar, EU)
+</pre>
+
+<h2 id="pipeline">4. Hoofdpijplijn</h2>
+<p>Van knop “Dit meetpunt analyseren” tot een TestPoint, en daarna de campagne-combinatie.</p>
+<div class="flow">
+  <div class="step"><b>1. Toestel toepassen</b> — tabel compartimenten → <code>main.configure_appliance()</code></div>
+  <div class="arrow">↓</div>
+  <div class="step"><b>2. Laden</b> — <code>load_and_align_data(power_glob, temp_csv)</code> → één tijdlijn power + T</div>
+  <div class="arrow">↓</div>
+  <div class="step"><b>3. Cycli</b> — <code>detect_tcc_cycles()</code> → histogram, drempel, TCC’s, defrost-vlag, T per cyclus</div>
+  <div class="arrow">↓</div>
+  <div class="step"><b>4. Steady state</b> — <code>analyze_steady_state()</code> → SS1, Pss (naar nominale Tamb), T_compartiment, CRtSS</div>
+  <div class="arrow">↓</div>
+  <div class="step"><b>5. Ontdooi-energie</b> — <code>analyze_defrost()</code> → ΔEdf uit D- en F-perioden</div>
+  <div class="arrow">↓</div>
+  <div class="step"><b>6. Ontdooi-interval</b> — compressor-aan-tijd tussen defrost-events → Δtrt; type toetsen (CRT / elapsed / variable)</div>
+  <div class="arrow">↓</div>
+  <div class="step"><b>7. TestPoint</b> — Edaily van deze instelling (nog niet op target)</div>
+  <div class="arrow">↓</div>
+  <div class="step"><b>8. Interpolatie</b> — onder- en boven-punt bij 16 °C en bij 32 °C → Edaily bij target</div>
+  <div class="arrow">↓</div>
+  <div class="step"><b>9. Jaarverbruik</b> — 182,5 dagen × beide Edaily</div>
+</div>
+
+<h2 id="main">5. main.py — één meting analyseren</h2>
+<p>
+Dit bestand is de signaalverwerker. Bovenaan staan globale configuratie (compartimenten, sensoren,
+bestandspaden, constanten c1/c2 voor de omgevingcorrectie). De GUI overschrijft die via
+<code>configure_appliance</code> voordat een run start.
+</p>
+
+<h3>Hulpmiddelen</h3>
+<table>
+  <tr><th>Functie</th><th>Wat het doet</th></tr>
+  <tr>
+    <td><code>format_dates</code></td>
+    <td>X-as van grafieken: dagen + uren.</td>
+  </tr>
+  <tr>
+    <td><code>plot_power_and_histogram</code></td>
+    <td>Vermogen versus tijd plus histogram; toont basisniveau, piekniveau en drempel.</td>
+  </tr>
+  <tr>
+    <td><code>plot_detected_cycles</code></td>
+    <td>Elke TCC als gekleurde band; optioneel de SS1-periode in blauw.</td>
+  </tr>
+  <tr>
+    <td><code>plot_compartment_temperatures</code></td>
+    <td>Tijdgewogen gemiddelde T per compartiment, per TCC.</td>
+  </tr>
+  <tr>
+    <td><code>weighted_mean_expr</code></td>
+    <td>Polars-expressie: som(waarde × gewicht) / som(gewicht). Gewicht is meestal de tijdsduur.</td>
+  </tr>
+  <tr>
+    <td><code>weighted_time_accumulation_expr_hours</code></td>
+    <td>Som van vermogen × tijd in uren → energie in Wh.</td>
+  </tr>
+  <tr>
+    <td><code>compute_daily_energy_kwh</code></td>
+    <td>Eenvoudige dagenergie voor de CLI: 24·Pss plus 24·ΔEdf/gemiddeld defrost-interval. De GUI gebruikt in plaats daarvan de CRT-formule in <code>en62552</code>.</td>
+  </tr>
+</table>
+
+<h3><code>configure_appliance</code></h3>
+<p>
+Zet de globale woordenboeken opnieuw: compartimenten, welke twee compartimenten de periodeselectie sturen
+(grootste frozen en/of unfrozen), lijst van alle sensors, kolomnamen <code>temp_mean_…</code>.
+Zonder deze stap zou de GUI de hardgecodeerde fridge/freezer-configuratie blijven gebruiken.
+</p>
+
+<h3><code>load_and_align_data(power_files, temp_file)</code></h3>
+<p>Maakt één LazyFrame op een gemeenschappelijke tijd-as.</p>
+<ol>
+  <li><strong>Power:</strong> <code>pl.scan_csv</code> op een glob. Datum + tijd + milliseconde → <code>Datetime</code>. Kolommen <code>WT1:…</code> worden hernoemd en naar float gezet.</li>
+  <li><strong>Temperatuur:</strong> UTF-16-CSV, 28 kopregels overslaan, alarmkolommen weg, <code>Time</code> parsen.</li>
+  <li><strong>Join:</strong> full join op tijd, numerieke kolommen interpoleren <em>langs de tijd</em>, daarna alleen timestamps houden die in de power-data zitten (semi-join). Zo volgt de sampling de vermogenslogger.</li>
+  <li>Kolom <code>meas_duration</code> / <code>duration_t</code> = tijd tot de volgende sample (voor tijdgewogen middeling).</li>
+</ol>
+
+<h3><code>detect_tcc_cycles(lf_meas_data)</code></h3>
+<p>Knipt het vermogenssignaal in compressorcycli.</p>
+<ol>
+  <li><strong>Median-filters</strong> op P-1: ~4 s (korte, voor aan/uit) en ~30 s (lange, voor niveaus).</li>
+  <li><strong>Histogram</strong> van het 30 s-signaal in bakken van 2 W. De twee hoogste bakken zijn basisniveau (uit) en piekniveau (aan).</li>
+  <li><strong>Activation / drempel:</strong> compressor “aan” als het korte gladgestreken signaal boven een drempel net boven het basisniveau komt. Cycli korter dan 5 minuten vallen weg (ruis).</li>
+  <li>Elke overgebleven aan-puls wordt een TCC met start, einde, totale duur en aan-duur.</li>
+  <li>Meetpunten die in een TCC vallen, krijgen dat <code>TCC_id</code>. Per cyclus: tijdgewogen gemiddelde van alle sensors en van P-1.</li>
+  <li><code>is_defrost_cycle</code> als er ergens in de cyclus P-1 &gt; 50 W is. <code>streak_id</code> = cumulatieve som van die vlag, zodat cycli tussen twee defrosts bij elkaar horen.</li>
+  <li>Compartimenttemperatuur = gemiddelde van de sensors van dat compartiment (EN 62552-3 D.3.4).</li>
+</ol>
+<p>Retour: <code>df_TCC</code>, <code>df_TCC_w_streaks_and_means</code>, meetdata-met-TCC-id, en plotgegevens.</p>
+
+<h3><code>get_period_stats(block_a, block_b, block_c)</code></h3>
+<p>
+Neemt drie blokken TCC’s (elk k cycli) en vat ze samen tot één periode: totale duur, tijdgewogen T,
+temperatuurspread en -helling (van blok A naar C), vermogensspread en -helling, gemiddeld vermogen,
+en CRtSS = aan-tijd / totale tijd × 100 %.
+</p>
+
+<h3><code>analyze_steady_state(df_TCC_w_streaks_and_means, nominal_ambient)</code></h3>
+<p>Zoekt de eerst afgeronde geldige steady-state-periode (SS1) en corrigeert het vermogen naar de nominale omgeving.</p>
+<ol>
+  <li>Per <code>streak_id</code> (stuk tussen defrosts): eerste twee en laatste TCC weglaten (overgang rond defrost). Te korte streaks overslaan.</li>
+  <li>Alle triple-blokken (start, n) langs lopen; statistieken cachen per blok. <code>n</code> = <code>N_TCC_per_block</code>, het aantal compressorcycli per blok; een periode is altijd 3 blokken.</li>
+  <li><strong>SS1-filter:</strong> duur ≥ 6 h; temp-spread &lt; 0,25 K op de selectiecompartimenten; vermogensspread afhankelijk van de duur (strenger bij 6–12 h); vermogenshelling &lt; 0,25 %/h; de twee perioden die één en twee TCC’s eerder starten moeten óók geldig zijn (stabiliteit niet toevallig).</li>
+  <li>Van de kandidaten de periode met het <strong>vroegste einde</strong> kiezen (kortste tijd vanaf de start van de meting). Bij gelijke eindtijd: kleinste n, daarna kortste duur. Vermogensspread is alleen tiebreaker → <code>ss1_opti</code>.</li>
+  <li><strong>Pss:</strong> gemiddeld vermogen van SS1, vermenigvuldigd met een correctie naar <code>nominal_ambient</code> (16 of 32 °C) met volumes, target-T en ΔCOP (Annex B / ISO 16358-achtige vorm met c1, c2).</li>
+</ol>
+<p>Retour: gekozen periode-dict, Pss (W), tabel van alle kandidaat-perioden, gemiddelde gemeten Tamb.</p>
+
+<h3><code>analyze_defrost(…)</code></h3>
+<p>Extra energie van ontdooien en weer op temperatuur komen (Annex C).</p>
+<ol>
+  <li>Defrost-TCC’s opzoeken. Rond het nominale midden (start + 2 h) liggen de zoekvensters voor D (vóór) en F (ná).</li>
+  <li>Uit de periodetabel: kandidaten met k ≥ 3, duur &gt; 3 h, matige spread. D komt uit de streak vóór de defrost, F uit de streak erna.</li>
+  <li>Alleen D/F-paren met ongeveer gelijke duur (ratio 0,8–1,25) en dezelfde k; kies het paar met de kleinste gecombineerde vermogensspread.</li>
+  <li>Energie van D-start tot F-einde minus de energie die je bij het gemiddelde van P_SS,D en P_SS,F in die tijd zou verwachten → <code>ΔEdf</code> in Wh.</li>
+</ol>
+<p>
+Als er geen geldig D/F-paar is, blijft ΔEdf 0 en gebruikt de rest van het programma alleen 24·Pss.
+De kloktijd tussen defrost-starts wordt nog wel berekend als <code>delta_t_df</code>, maar het
+ontdooi-<em>interval voor Edaily</em> komt in de GUI uit de compressor-run-time (zie hieronder).
+</p>
+
+<h3><code>if __name__ == "__main__"</code></h3>
+<p>
+Voert dezelfde vier stappen uit voor de hardgecodeerde paden, print dagverbruik, gemiddelde cyclustijd
+en compressor-aan-percentage. Handig om één bestandset te debuggen zonder Streamlit.
+</p>
+
+<h2 id="en">6. en62552.py — campagne, interpolatie, jaarverbruik</h2>
+<p>
+Geen CSV-verwerking. Alleen de rekenregels van de norm die over <em>meerdere</em> TestPoints gaan,
+plus classificatie van de ontdooiregelaar.
+</p>
+
+<h3>Constanten en types</h3>
+<table>
+  <tr><th>Naam</th><th>Rol</th></tr>
+  <tr><td><code>COMPARTMENT_TARGETS_C</code></td><td>Tabel 1: doeltemperatuur per compartimentsoort</td></tr>
+  <tr><td><code>FROZEN_TYPES</code></td><td>Welke types “frozen” zijn voor periodeselectie</td></tr>
+  <tr><td><code>DAYS_AT_16_C / DAYS_AT_32_C</code></td><td>182,5 dagen — Europese regionale functie</td></tr>
+  <tr><td><code>frozen_unfrozen()</code></td><td>Tabel-1-type → frozen of unfrozen</td></tr>
+  <tr><td><code>TestPoint</code></td><td>Zie § 3.4; property <code>edaily_wh</code> is formule (1)/(2)</td></tr>
+  <tr><td><code>DefrostClassification</code></td><td>Uitkomst van de CRT-toets: kind, gemiddelden, CV, eventuele waarschuwing</td></tr>
+  <tr><td><code>InterpolationResult</code></td><td>Geldigheid, Edaily bij target, welk compartiment als interpolatie-as diende, meldingen</td></tr>
+</table>
+
+<h3><code>defrost_interval_crt</code> — formule (26)</h3>
+<p class="formula">Δt<sub>df</sub> = (Δt<sub>rt</sub> − Δt<sub>dr</sub> − Δt<sub>dh</sub>) / (CRtSS / 100) + Δt<sub>dxy</sub></p>
+<p>
+Zet de <em>compressor-run-time</em> tussen twee ontdooiingen om in een kloktijd-interval, via het
+steady-state aan-percentage. Δtdr en Δtdh zijn in deze versie 0 (timer tijdens heater is niet gemeten).
+</p>
+
+<h3><code>defrost_intervals_from_cycles</code></h3>
+<p>
+Loopt langs de TCC-vlag <code>is_defrost</code>. Opeenvolgende defrost-TCC’s tellen als <em>één</em> event.
+Tussen event j en j+1:
+</p>
+<ul>
+  <li><strong>Δtcrt</strong> = som van <code>TCC_on_duration</code> (uren) — dit is de schatting van Δtrt</li>
+  <li><strong>elapsed</strong> = verschil van de starttijden (uren)</li>
+</ul>
+<p>Er zijn minstens twee events nodig voor één interval, en minstens twee intervallen om een CV te toetsen.</p>
+
+<h3><code>classify_defrost_controller</code></h3>
+<p>Annex D onderscheidt hoe de volgende ontdooiing wordt getriggerd. Deze code toetst dat aan de metingen:</p>
+<table>
+  <tr><th>kind</th><th>Voorwaarde</th><th>Gevolg</th></tr>
+  <tr><td><code>onvoldoende_data</code></td><td>minder dan 2 intervallen</td><td>waarschuwing; Δtrt mag nog gebruikt worden als er één interval is</td></tr>
+  <tr><td><code>compressor_run_time</code></td><td>CV van Δtrt &lt; 10 %</td><td>CRT bevestigd; formule 26</td></tr>
+  <tr><td><code>elapsed_time</code></td><td>CV van kloktijd &lt; 10 % (en CRT niet)</td><td>waarschuwing; Δtdf = gemiddelde kloktijd</td></tr>
+  <tr><td><code>variable</code></td><td>beide CV’s groot</td><td>waarschuwing demand/variable; formule 26 is onbetrouwbaar maar wordt nog getoond</td></tr>
+</table>
+
+<h3><code>check_vs_target_label</code></h3>
+<p>
+De knop is alleen “kouder” of “warmer” dan target. Als alle gemeten compartiment-T’s het omgekeerde
+laten zien, komt er een waarschuwing. Interpolatie zelf kijkt naar de <em>gemeten</em> temperaturen
+(target moet tussen T1 en T2 liggen).
+</p>
+
+<h3><code>linear_interpolate_case1</code> — Annex E.3</h3>
+<p>
+Twee TestPoints bij dezelfde Tamb. Voor elk compartiment i als mogelijke interpolatie-as:
+</p>
+<ol>
+  <li>|T1 − T2| mag max. 4 K zijn (geen interpolatie over een te groot gat).</li>
+  <li>De target moet <em>tussen</em> T1 en T2 liggen (geen extrapolatie): interpolatiefactor f tussen 0 en 1.</li>
+  <li>Zet alle andere compartimenten met dezelfde f op de lijn; géén mag daarbij boven zijn eigen target uitkomen.</li>
+  <li>Edaily_target = E1 + f · (E2 − E1).</li>
+</ol>
+<p>
+Als meerdere compartimenten een geldige interpolatie geven, kiest de code de variant met de
+<strong>laagste</strong> Edaily (conservatief / voordeligst volgens de E.3-keuze in deze implementatie).
+</p>
+
+<h3><code>resolve_ambient_edaily</code></h3>
+<p>
+Filtert punten rond 16 of 32 °C. Splits in <code>vs_target == onder</code> en <code>boven</code>.
+Zonder beide kanten: ongeldig (geen 6.3 a-fallback meer). Probeert alle onder×boven-paren;
+houdt de geldige interpolatie met de laagste Edaily.
+</p>
+
+<h3><code>annual_energy_europe_kwh</code></h3>
+<p class="formula">E<sub>total</sub> = 182,5 · E<sub>daily,16</sub> + 182,5 · E<sub>daily,32</sub></p>
+<p>Eaux (ijsbereiding e.d.) is 0 in dit project.</p>
+
+<h3><code>campaign_status</code></h3>
+<p>
+Checklist voor de GUI: of er al geanalyseerde punten zijn voor 16-onder, 16-boven, 32-onder, 32-boven,
+en of de interpolaties geldig zijn.
+</p>
+
+<h2 id="app">7. app.py — grafische interface</h2>
+<p>
+Streamlit-app. Session state is het werkgeheugen van de campagne. Bij elke interactie draait het
+script opnieuw; daarom staan tabellen en testlijsten in <code>st.session_state</code>.
+</p>
+
+<h3>Tabbladen</h3>
+<table>
+  <tr><th>Tab</th><th>Inhoud</th></tr>
+  <tr><td>Wat is nodig</td><td>Stappen van de norm + groene/oranje checklist uit <code>campaign_status</code></td></tr>
+  <tr><td>Toestel</td><td>Bewerkbare tabel compartimenten (rijen toevoegen/wijzigen), sensors, uitleg CRT</td></tr>
+  <tr><td>Meetpunten</td><td>Per test: Tamb, onder/boven, bestandspaden, knop Analyseren</td></tr>
+  <tr><td>Analyse één meting</td><td>Pss, ΔEdf, gemeten Δtrt, grafieken van de laatst gedraaide run</td></tr>
+  <tr><td>Interpolatie &amp; jaarverbruik</td><td>Ontdooitype over alle runs, tabel TestPoints, Edaily 16/32, E_total</td></tr>
+  <tr><td>Log</td><td>stdout/traceback van de analysefuncties</td></tr>
+</table>
+
+<h3>Belangrijke functies</h3>
+<table>
+  <tr><th>Functie</th><th>Wat het doet</th></tr>
+  <tr>
+    <td><code>_init_state</code></td>
+    <td>Zet defaults: twee voorbeeldcompartimenten, vier meetpunten, lege analyseresultaten.</td>
+  </tr>
+  <tr>
+    <td><code>apply_appliance_config</code></td>
+    <td>Leest de tabel, controleert sensors/type, roept <code>configure_appliance</code> aan.</td>
+  </tr>
+  <tr>
+    <td><code>run_full_test(test)</code></td>
+    <td>Volledige pijplijn § 4 stappen 1–7 voor één meetpunt; schrijft resultaten in session state en in <code>test["point"]</code>.</td>
+  </tr>
+  <tr>
+    <td><code>_extract_defrost_intervals</code></td>
+    <td>Haalt kolommen uit de TCC-tabel en roept <code>defrost_intervals_from_cycles</code> aan.</td>
+  </tr>
+  <tr>
+    <td><code>campaign_defrost_classification</code></td>
+    <td>Alle <code>tcrt_hours</code> / <code>elapsed_hours</code> van alle tests bij elkaar, dan classificeren.</td>
+  </tr>
+  <tr>
+    <td><code>collected_points</code></td>
+    <td>Bouwt TestPoints; zet Δtdf opnieuw op basis van de <em>campagnebrede</em> Δtrt (niet alleen de lokale run).</td>
+  </tr>
+</table>
+<div class="box">
+  <strong>Reload van en62552</strong><br>
+  Streamlit herlaadt <code>app.py</code> bij wijzigingen, maar houdt geïmporteerde modules soms in het geheugen.
+  Daarom staat bovenaan <code>en62552 = reload(en62552)</code>.
+</div>
+
+<h2 id="formules">8. Formules uit de norm (zoals in de code)</h2>
+<table>
+  <tr><th>Waar</th><th>Formule</th><th>Code</th></tr>
+  <tr>
+    <td>Edaily zonder bruikbare defrost</td>
+    <td>24 · Pss</td>
+    <td><code>TestPoint.edaily_wh</code></td>
+  </tr>
+  <tr>
+    <td>Edaily met defrost (1)/(2)</td>
+    <td>24 · Pss + 24 · ΔEdf / Δtdf</td>
+    <td>zelfde property</td>
+  </tr>
+  <tr>
+    <td>ΔEdf (Annex C)</td>
+    <td>E<sub>D→F</sub> − Δt · (P<sub>SS,D</sub> + P<sub>SS,F</sub>) / 2</td>
+    <td><code>analyze_defrost</code></td>
+  </tr>
+  <tr>
+    <td>Δtdf uit CRT (26)</td>
+    <td>(Δtrt − Δtdr − Δtdh) / (CRtSS/100) + Δtdxy</td>
+    <td><code>defrost_interval_crt</code></td>
+  </tr>
+  <tr>
+    <td>Interpolatie E.3</td>
+    <td>f = (T<sub>tar</sub> − T1) / (T2 − T1); E = E1 + f · (E2 − E1)</td>
+    <td><code>linear_interpolate_case1</code></td>
+  </tr>
+  <tr>
+    <td>Jaar EU</td>
+    <td>182,5 · Edaily16 + 182,5 · Edaily32</td>
+    <td><code>annual_energy_europe_kwh</code></td>
+  </tr>
+  <tr>
+    <td>Pss-omgevingscorrectie</td>
+    <td>Pss1 × (1 + ((T<sub>nom</sub> − T<sub>amb</sub>) / (1 + (T<sub>nom</sub> − T<sub>amb</sub>)·ΔCOP)) · teller/noemer)</td>
+    <td><code>analyze_steady_state</code></td>
+  </tr>
+</table>
+<p>
+Eenheden in de code: Pss in watt, ΔEdf in wattuur, Δtdf in uur, Edaily-property in wattuur per dag
+(delen door 1000 geeft kWh/d).
+</p>
+
+<h2 id="beperkingen">9. Aannames en beperkingen</h2>
+<ul>
+  <li>Geen ijsbereiding of andere Eaux.</li>
+  <li>Geen load-processing (Annex G) en geen triangulatie bij twee onafhankelijke thermostaten (Annex E.4).</li>
+  <li>Edaily bij target altijd via interpolatie onder/boven; een enkel punt dat al op target ligt telt niet als eindresultaat.</li>
+  <li>Compressor wordt als puur aan/uit gemodelleerd (geen inverter-tussenstanden in de TCC-knip).</li>
+  <li>Defrost-detectie: vermogenpiek &gt; 50 W — een heuristiek, geen aparte heater-kanaal.</li>
+  <li>Δtdh (timer tijdens verwarming) wordt niet gemeten.</li>
+  <li>Volume is gebruikersinvoer, geen geometrische Annex-H-meting in deze software.</li>
+</ul>
+
+<div class="box ok">
+  <strong>Kortste leesvolgorde in de code</strong>
+  <ol>
+    <li><code>app.py</code> → <code>run_full_test</code> (wie roept wat aan)</li>
+    <li><code>main.py</code> → <code>load_and_align_data</code>, <code>detect_tcc_cycles</code>, <code>analyze_steady_state</code>, <code>analyze_defrost</code></li>
+    <li><code>en62552.py</code> → <code>TestPoint</code>, <code>classify_defrost_controller</code>, <code>linear_interpolate_case1</code>, <code>resolve_ambient_edaily</code></li>
+  </ol>
+</div>
+
+<p class="meta">Einde van het document. Broncode: main.py, en62552.py, app.py in dezelfde map.</p>
+</body>
+</html>
