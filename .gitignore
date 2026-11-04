@@ -14,6 +14,10 @@ power_meetdata_map/
 power_meetdata_mapx/
 temp_meetdata_map/
 temp_meetdata_mapx/
+koelkast/
+
+# Lokale Streamlit-serverconfig
+.streamlit/
 
 # Tussentijdse analysebestanden
 *.parquet

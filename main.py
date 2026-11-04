@@ -57,7 +57,9 @@ HOOFDPROCEDURE:
 from time import time
 
 start_time = time()
-from datetime import timedelta
+from datetime import datetime, timedelta
+from glob import glob
+from pathlib import Path
 import re
 import numpy as np
 import polars as pl
@@ -73,6 +75,15 @@ DEBUG = True
 DEBUG = False
 DEBUG3 = True
 DEBUG3 = False
+
+
+class SS1NotFoundError(ValueError):
+    """Geen geldige SS1, met tabel van alle kandidaat-perioden en waarom ze afvallen."""
+
+    def __init__(self, message: str, diagnostics=None, summary=None):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+        self.summary = summary or {}
 
 
 def format_dates(fig, ax):
@@ -317,6 +328,7 @@ val_col_smooth_long: str = "P-1_smooth_30_sec"
 val_col_smooth_short: str = "P-1_smooth_4_sec"
 duration_col: str = "duration_t"
 power_col: str = "P-1"
+defrost_power_threshold_w: float = 50.0
 
 ROUNDING_INTERVAL = 2.0  # watts for histogram binning when determining base/peak levels
 
@@ -337,6 +349,7 @@ def configure_appliance(
     new_compartments: dict,
     ambient_sensors: list[str] | None = None,
     gradient_sensors: list[str] | None = None,
+    defrost_power_w: float | None = None,
 ) -> None:
     """Zet compartimenten/volumes/sensoren voor een nieuwe toestelconfiguratie."""
     global compartments, compartments_used_for_period_selection
@@ -344,12 +357,15 @@ def configure_appliance(
     global mean_temp_cols, mean_temp_cols_for_period_selection
     global ambient_temp_sensors, gradient_temp_sensors
     global N_compartments, N_compartment_types
+    global defrost_power_threshold_w
 
     compartments = new_compartments
     if ambient_sensors is not None:
         ambient_temp_sensors = list(ambient_sensors)
     if gradient_sensors is not None:
         gradient_temp_sensors = list(gradient_sensors)
+    if defrost_power_w is not None:
+        defrost_power_threshold_w = float(defrost_power_w)
 
     N_compartment_types = len(
         {compartment["compartment type"] for compartment in compartments.values()}
@@ -499,7 +515,218 @@ def _detect_text_encoding(path: str) -> str:
     return "utf-8"
 
 
+def _first_existing_path(files: str | list[str]) -> str:
+    if isinstance(files, (list, tuple)):
+        if not files:
+            raise FileNotFoundError("Geen power-bestanden opgegeven.")
+        return str(files[0])
+    matches = glob(files)
+    if matches:
+        return matches[0]
+    if Path(files).is_file():
+        return files
+    raise FileNotFoundError(f"Geen power-bestand gevonden: {files}")
+
+
+def _detect_csv_separator(path: str) -> str:
+    """Yokogawa-exports gebruiken ';', oudere dumps soms ','."""
+    with open(path, encoding="utf-8-sig", errors="replace") as fh:
+        header = fh.readline()
+    return ";" if header.count(";") > header.count(",") else ","
+
+
+POWER_TIME_SLACK = timedelta(hours=6)
+
+
+def _decode_text_sample(raw: bytes, encoding: str | None = None) -> str:
+    enc = encoding or _detect_text_encoding_from_bytes(raw[:4])
+    return raw.decode(enc, errors="replace")
+
+
+def _detect_text_encoding_from_bytes(raw: bytes) -> str:
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return "UTF-16"
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    return "utf-8"
+
+
+def _read_last_nonempty_line(path: str, encoding: str) -> str:
+    with open(path, "rb") as fh:
+        fh.seek(0, 2)
+        size = fh.tell()
+        fh.seek(max(0, size - 131072))
+        chunk = fh.read()
+    if encoding.upper().startswith("UTF-16"):
+        text = chunk.decode(encoding, errors="replace")
+    else:
+        text = chunk.decode(encoding, errors="replace")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
+def _power_datetime_from_row(header: str, line: str, sep: str) -> datetime | None:
+    cols = [c.strip() for c in header.strip().split(sep)]
+    vals = [v.strip() for v in line.strip().split(sep)]
+    if len(vals) < 3 or len(cols) < 3:
+        return None
+    row = dict(zip(cols, vals))
+    date = row.get("Date")
+    time_v = row.get("Time")
+    if not date or not time_v:
+        return None
+    ms = str(row.get("Millisecond") or "0").strip() or "0"
+    ms = ms.split(".")[0].zfill(3)[:3]
+    try:
+        return datetime.strptime(f"{date} {time_v}.{ms}", "%Y/%m/%d %H:%M:%S.%f")
+    except ValueError:
+        try:
+            return datetime.strptime(f"{date} {time_v}", "%Y/%m/%d %H:%M:%S")
+        except ValueError:
+            return None
+
+
+def power_file_span(path: str) -> tuple[datetime, datetime] | None:
+    """Eerste en laatste timestamp van een wattmeter-CSV, zonder het hele bestand te lezen."""
+    encoding = _detect_text_encoding(path)
+    sep = _detect_csv_separator(path)
+    with open(path, encoding=encoding, errors="replace") as fh:
+        header = fh.readline()
+        first = ""
+        for line in fh:
+            if line.strip():
+                first = line
+                break
+    if not header or not first:
+        return None
+    last = _read_last_nonempty_line(path, encoding)
+    t0 = _power_datetime_from_row(header, first, sep)
+    t1 = _power_datetime_from_row(header, last, sep) or t0
+    if t0 is None:
+        return None
+    if t1 < t0:
+        t0, t1 = t1, t0
+    return t0, t1
+
+
+def temp_file_span(path: str) -> tuple[datetime, datetime]:
+    encoding = _detect_text_encoding(path)
+    skip = _temp_csv_header_skip(path, encoding)
+    df = pl.read_csv(
+        path,
+        skip_rows=skip,
+        encoding=encoding,
+        truncate_ragged_lines=True,
+        columns=["Time"],
+    )
+    if "Time" not in df.columns or df.height == 0:
+        raise ValueError(f"Geen tijdkolom in temperatuur-CSV: {path}")
+    times = (
+        df.lazy()
+        .select(pl.col("Time").str.to_datetime("%d-%m-%Y %H:%M:%S:%3f", strict=False))
+        .drop_nulls()
+        .collect()
+    )
+    if times.height == 0:
+        raise ValueError(f"Geen geldige tijden in temperatuur-CSV: {path}")
+    tmin = times["Time"].min()
+    tmax = times["Time"].max()
+    if hasattr(tmin, "to_pydatetime"):
+        tmin = tmin.to_pydatetime()
+        tmax = tmax.to_pydatetime()
+    return tmin, tmax
+
+
+def select_power_files_for_temp(
+    power_files: str | list[str],
+    temp_file: str,
+    slack: timedelta | None = None,
+) -> list[str]:
+    """Kies power-CSV’s waarvan de tijdspanne de temperatuurmeting raakt (met marge)."""
+    slack = slack if slack is not None else POWER_TIME_SLACK
+    if isinstance(power_files, (str, Path)):
+        raw = glob(str(power_files))
+        if not raw and Path(power_files).is_dir():
+            raw = [
+                str(p)
+                for p in Path(power_files).iterdir()
+                if p.is_file() and p.suffix.lower() in {".csv", ".txt", ".dat"}
+            ]
+        paths = raw
+    else:
+        paths = [str(p) for p in power_files]
+    paths = [p for p in paths if Path(p).is_file()]
+    if not paths:
+        raise FileNotFoundError("Geen power-bestanden om uit te kiezen.")
+    tmin, tmax = temp_file_span(temp_file)
+    window_lo = tmin - slack
+    window_hi = tmax + slack
+    spans: list[tuple[str, datetime, datetime]] = []
+    for path in paths:
+        span = power_file_span(path)
+        if span is None:
+            continue
+        spans.append((path, span[0], span[1]))
+    if not spans:
+        raise ValueError("Kon in geen enkel power-bestand een tijdspanne lezen.")
+    chosen = [
+        (p, a, b) for p, a, b in spans if b >= window_lo and a <= window_hi
+    ]
+    if not chosen:
+        def _gap(a: datetime, b: datetime) -> float:
+            if b < tmin:
+                return (tmin - b).total_seconds()
+            if a > tmax:
+                return (a - tmax).total_seconds()
+            return 0.0
+
+        nearest = min(spans, key=lambda x: _gap(x[1], x[2]))
+        nearest_gap = _gap(nearest[1], nearest[2])
+        if nearest_gap > timedelta(hours=24).total_seconds():
+            listing = "; ".join(
+                f"{Path(p).name}: {a} – {b}" for p, a, b in sorted(spans, key=lambda x: x[1])[:8]
+            )
+            raise ValueError(
+                "Geen power-bestanden bij de temperatuurmeting. "
+                f"Temperatuur: {tmin} – {tmax}. Power: {listing}"
+            )
+        cluster_lo = nearest[1] - slack
+        cluster_hi = nearest[2] + slack
+        chosen = [(p, a, b) for p, a, b in spans if b >= cluster_lo and a <= cluster_hi]
+    cmin = min(a for _, a, _ in chosen)
+    cmax = max(b for _, _, b in chosen)
+    filled = [(p, a, b) for p, a, b in spans if b >= cmin and a <= cmax]
+    filled.sort(key=lambda x: x[1])
+    return [p for p, _, _ in filled]
+
+
 _WATTMETER_PREFIX = re.compile(r"^WT\d+:")
+
+
+def _cast_numeric_csv_col(col: str) -> pl.Expr:
+    return (
+        pl.col(col)
+        .cast(pl.Utf8)
+        .str.strip_chars()
+        .replace(["NAN", "Error", "ERROR", "---", ""], None)
+        .cast(pl.Float64, strict=False)
+    )
+
+
+def _ensure_power_column(lf: pl.LazyFrame, names: list[str]) -> pl.LazyFrame:
+    """Zorg voor een numerieke P-1-kolom; ontbreekt die, dan U-1 × I-1."""
+    if power_col in names:
+        return lf.with_columns(_cast_numeric_csv_col(power_col))
+    if "U-1" in names and "I-1" in names:
+        lf = lf.with_columns(
+            _cast_numeric_csv_col("U-1"),
+            _cast_numeric_csv_col("I-1"),
+        ).with_columns((pl.col("U-1") * pl.col("I-1")).alias(power_col))
+        print("vermogen: P-1 = U-1 × I-1 (geen P-kanaal in de CSV)")
+        return lf
+    raise ValueError(
+        f"Geen vermogenskolom '{power_col}' gevonden. Kolommen: {names}"
+    )
 
 
 def _normalize_wattmeter_columns(lf: pl.LazyFrame) -> pl.LazyFrame:
@@ -507,11 +734,7 @@ def _normalize_wattmeter_columns(lf: pl.LazyFrame) -> pl.LazyFrame:
     names = lf.collect_schema().names()
     wt_cols = [c for c in names if _WATTMETER_PREFIX.match(c)]
     if not wt_cols:
-        if power_col not in names:
-            raise ValueError(
-                f"Geen vermogenskolom '{power_col}' gevonden. Kolommen: {names}"
-            )
-        return lf
+        return _ensure_power_column(lf, names)
 
     lf = lf.with_columns(
         [
@@ -578,10 +801,20 @@ def load_and_align_data(
     De CSV-scans, de join en de interpolatie blijven een Polars LazyFrame tot de caller
     materialiseert. Temperatuurdata wordt eager gelezen vanwege UTF-16, daarna direct lazy.
     """
+    sep = _detect_csv_separator(_first_existing_path(power_files))
+    lf_power = pl.scan_csv(power_files, infer_schema=False, separator=sep)
+    names = lf_power.collect_schema().names()
+    if "StoreNo" in names and "Store No." not in names:
+        lf_power = lf_power.rename({"StoreNo": "Store No."})
+        names = lf_power.collect_schema().names()
+    if "Date" not in names:
+        raise ValueError(
+            "Power-CSV heeft geen kolom 'Date'. "
+            f"Scheidingsteken={sep!r}. Kolommen: {names}"
+        )
+    drop_power = [c for c in ("Date", "Time", "Millisecond", "Store No.") if c in names]
     lf_power = (
-        pl.scan_csv(power_files, infer_schema=False)
-        .select(~cs.contains("duplicated"))
-        # Create Datetime and drop old cols in one select
+        lf_power.select(~cs.contains("duplicated"))
         .with_columns(
             pl.format(
                 "{} {}.{}",
@@ -592,7 +825,7 @@ def load_and_align_data(
             .str.to_datetime("%Y/%m/%d %H:%M:%S.%3f")
             .alias(time_col)
         )
-        .drop(["Date", "Time", "Millisecond", "Store No."])
+        .drop(drop_power)
     )
     lf_power = _normalize_wattmeter_columns(lf_power)
     lf_power = (
@@ -600,6 +833,11 @@ def load_and_align_data(
         .select([time_col, cs.all().exclude(time_col)])
         .sort(time_col)
     )
+    power_span = lf_power.select(
+        pl.col(time_col).min().alias("tmin"),
+        pl.col(time_col).max().alias("tmax"),
+        pl.len().alias("n"),
+    ).collect().row(0, named=True)
 
     # Temp pipeline: UTF-16 is niet betrouwbaar via scan_csv, daarom read_csv + lazy().
     # Het aantal kopregels hangt af van het aantal kanalen; zoek de regel Scan,Time.
@@ -627,6 +865,25 @@ def load_and_align_data(
         .select([time_col, cs.all().exclude(time_col)])
         .sort(time_col)
     )
+    temp_span = lf_temp.select(
+        pl.col(time_col).min().alias("tmin"),
+        pl.col(time_col).max().alias("tmax"),
+        pl.len().alias("n"),
+    ).collect().row(0, named=True)
+    if (
+        power_span["tmin"] is None
+        or temp_span["tmin"] is None
+        or power_span["tmax"] < temp_span["tmin"]
+        or temp_span["tmax"] < power_span["tmin"]
+    ):
+        raise ValueError(
+            "Power- en temperatuurdata overlappen niet in de tijd. "
+            f"Power: {power_span['tmin']} – {power_span['tmax']} "
+            f"({power_span['n']} rijen). "
+            f"Temperatuur: {temp_span['tmin']} – {temp_span['tmax']} "
+            f"({temp_span['n']} rijen). "
+            "Kies bestanden van dezelfde meetperiode."
+        )
 
     # Join and interpolate. Semi-join houdt alleen timestamps die in de power-data zitten.
     lf_meas_data = (
@@ -635,7 +892,15 @@ def load_and_align_data(
         # interpolate using time column
         .with_columns(cs.numeric().exclude(time_col).interpolate_by(pl.col(time_col)))
         .with_columns(meas_duration=pl.col("Datetime").diff().shift(-1))
-        .drop_nulls()
+        .drop_nulls(subset=[time_col, power_col])
+        # Alleen het overlappende deel: buiten de temp-reeks blijft interpolatie leeg.
+        .filter(
+            pl.any_horizontal(
+                pl.col(c).is_not_null()
+                for c in lf_temp.collect_schema().names()
+                if c != time_col
+            )
+        )
         # Semi-join acts as a filter to keep only timestamps present in power
         .join(lf_power.select(time_col), on=time_col, how="semi")
         .with_columns(pl.col(time_col).diff().shift(-1).alias(duration_col))
@@ -648,6 +913,7 @@ def detect_tcc_cycles(
     lf_meas_data: pl.LazyFrame,
     *,
     make_plots: bool | None = None,
+    defrost_power_w: float | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, dict]:
     """Filter het vermogenssignaal en knip het op in compressor-cycli (TCC's).
 
@@ -656,23 +922,41 @@ def detect_tcc_cycles(
     """
     if make_plots is None:
         make_plots = DEBUG
+    thresh_w = float(
+        defrost_power_threshold_w if defrost_power_w is None else defrost_power_w
+    )
+    print(f"ontdooi-drempel: P > {thresh_w:g} W")
     start_time = time()
     df_meas_data = lf_meas_data.collect()
     # df_meas_data.write_parquet("df_meas_data.parquet")
     # sys.exit(0)
     print(f"everything before smoothing filter took {time() - start_time:.5f} seconds")
+    if df_meas_data.height < 2:
+        raise ValueError(
+            f"Te weinig meetpunten na uitlijnen ({df_meas_data.height}). "
+            "Power- en temperatuurreeksen overlappen waarschijnlijk niet."
+        )
 
-    mean_sampling_interval_seconds = (
+    mean_dur = (
         df_meas_data.lazy()
         .select(pl.col(duration_col).mean())
         .collect()
         .item()
-        .total_seconds()
     )
+    if mean_dur is None:
+        raise ValueError(
+            "Geen geldige tijdsintervallen in de uitgelijnde meetdata "
+            f"(kolom {duration_col})."
+        )
+    mean_sampling_interval_seconds = mean_dur.total_seconds()
+    if mean_sampling_interval_seconds <= 0:
+        raise ValueError(
+            f"Ongeldig sampling-interval: {mean_sampling_interval_seconds} s."
+        )
     sigma_seconds_long = 30  # seconds
-    sigma_samples_long = int(sigma_seconds_long / mean_sampling_interval_seconds)
+    sigma_samples_long = max(3, int(sigma_seconds_long / mean_sampling_interval_seconds))
     sigma_seconds_short = 4  # seconds
-    sigma_samples_short = int(sigma_seconds_short / mean_sampling_interval_seconds)
+    sigma_samples_short = max(3, int(sigma_seconds_short / mean_sampling_interval_seconds))
 
     start_time = time()
     df_meas_data_w_median = (
@@ -824,7 +1108,7 @@ def detect_tcc_cycles(
         df_TCC.lazy()
         .join(
             df_meas_data_w_smooth_w_TCC_id.lazy()
-            .with_columns(is_defrost_cycle=pl.col(power_col) > 50)
+            .with_columns(is_defrost_cycle=pl.col(power_col) > thresh_w)
             .group_by("TCC_id")
             .agg(
                 [
@@ -874,6 +1158,161 @@ def detect_tcc_cycles(
         "peak_level": peak_level,
     }
     return df_TCC, df_TCC_w_streaks_and_means, df_meas_data_w_smooth_w_TCC_id, plot_data
+
+
+def _ss1_power_spread_limit_expr() -> pl.Expr:
+    hours = pl.col("period_duration").dt.total_seconds() / 3600
+    return (
+        pl.when(pl.col("period_duration") <= timedelta(hours=12))
+        .then(1.0)
+        .when(pl.col("period_duration") < timedelta(hours=36))
+        .then(1.0 + (hours - 12.0) / 1200.0)
+        .otherwise(3.0)
+    )
+
+
+def annotate_ss1_periods(df: pl.DataFrame) -> pl.DataFrame:
+    """Voeg ISO 16358 / Annex B-vinkjes en faalredenen toe aan alle 3-blok-perioden."""
+    if df.height == 0:
+        return df
+    spread_cols = [c for c in df.columns if str(c).startswith("temp_spread_")]
+    slope_cols = [c for c in df.columns if str(c).startswith("temp_slope_")]
+    lf = df.lazy().with_columns(
+        period_hours=pl.col("period_duration").dt.total_seconds() / 3600.0,
+        n_TCC=pl.col("N_TCC_per_block") * 3,
+        power_spread_limit_pct=_ss1_power_spread_limit_expr(),
+    )
+    lf = lf.with_columns(
+        ok_duration=pl.col("period_duration") >= timedelta(hours=6),
+        ok_temp_spread=(
+            pl.all_horizontal(pl.col(c) < 0.25 for c in spread_cols)
+            if spread_cols
+            else pl.lit(True)
+        ),
+        ok_power_spread=pl.col("power_spread_pct") <= pl.col("power_spread_limit_pct"),
+        ok_power_slope=pl.col("power_slope_pct").abs() < 0.25,
+        max_temp_spread_K=(
+            pl.max_horizontal(pl.col(c) for c in spread_cols) if spread_cols else pl.lit(None)
+        ),
+        max_temp_slope_K_per_h=(
+            pl.max_horizontal(pl.col(c).abs() for c in slope_cols)
+            if slope_cols
+            else pl.lit(None)
+        ),
+    )
+    lf = (
+        lf.sort(["streak_id", "N_TCC_per_block", "start_TCC_id"])
+        .with_columns(
+            prev_two_periods_also_valid=(
+                pl.col("start_TCC_id")
+                == (
+                    pl.col("start_TCC_id")
+                    .shift(1)
+                    .over("N_TCC_per_block", "streak_id")
+                    + 1
+                )
+            )
+            & (
+                pl.col("start_TCC_id")
+                == (
+                    pl.col("start_TCC_id")
+                    .shift(2)
+                    .over("N_TCC_per_block", "streak_id")
+                    + 2
+                )
+            )
+        )
+        .with_columns(
+            pl.col("prev_two_periods_also_valid").fill_null(False),
+        )
+        .with_columns(
+            ok_ss1=(
+                pl.col("ok_duration")
+                & pl.col("ok_temp_spread")
+                & pl.col("ok_power_spread")
+                & pl.col("ok_power_slope")
+                & pl.col("prev_two_periods_also_valid")
+            )
+        )
+        .with_columns(
+            fail_reason=pl.concat_str(
+                [
+                    pl.when(~pl.col("ok_duration"))
+                    .then(
+                        pl.format(
+                            "duur {} h < 6 h",
+                            pl.col("period_hours").round(2),
+                        )
+                    )
+                    .otherwise(pl.lit("")),
+                    pl.when(~pl.col("ok_temp_spread"))
+                    .then(
+                        pl.format(
+                            "temp-spread {} K ≥ 0,25 K",
+                            pl.col("max_temp_spread_K").round(3),
+                        )
+                    )
+                    .otherwise(pl.lit("")),
+                    pl.when(~pl.col("ok_power_spread"))
+                    .then(
+                        pl.format(
+                            "P-spread {} % > limiet {} %",
+                            pl.col("power_spread_pct").round(3),
+                            pl.col("power_spread_limit_pct").round(3),
+                        )
+                    )
+                    .otherwise(pl.lit("")),
+                    pl.when(~pl.col("ok_power_slope"))
+                    .then(
+                        pl.format(
+                            "|P-helling| {} %/h ≥ 0,25 %/h",
+                            pl.col("power_slope_pct").abs().round(4),
+                        )
+                    )
+                    .otherwise(pl.lit("")),
+                    pl.when(~pl.col("prev_two_periods_also_valid"))
+                    .then(pl.lit("start−1 en start−2 niet beide geldig"))
+                    .otherwise(pl.lit("")),
+                ],
+                separator="; ",
+            )
+        )
+        .with_columns(
+            fail_reason=pl.col("fail_reason").str.replace_all(r"(^; )|(; $)|(; ){2,}", "; ").str.strip_chars("; ")
+        )
+        .with_columns(
+            fail_reason=pl.when(pl.col("ok_ss1"))
+            .then(pl.lit("voldoet"))
+            .otherwise(pl.col("fail_reason"))
+        )
+        .sort(
+            [
+                pl.col("ok_ss1"),
+                pl.col("ok_duration"),
+                pl.col("ok_power_slope"),
+                pl.col("ok_temp_spread"),
+                pl.col("period_hours"),
+            ],
+            descending=[True, True, True, True, True],
+        )
+    )
+    return lf.collect()
+
+
+def ss1_diagnostics_summary(diag: pl.DataFrame) -> dict:
+    n = diag.height
+    if n == 0:
+        return {"n_periods": 0}
+    return {
+        "n_periods": n,
+        "n_ok_ss1": int(diag["ok_ss1"].sum()),
+        "n_ok_duration": int(diag["ok_duration"].sum()),
+        "n_ok_temp_spread": int(diag["ok_temp_spread"].sum()),
+        "n_ok_power_spread": int(diag["ok_power_spread"].sum()),
+        "n_ok_power_slope": int(diag["ok_power_slope"].sum()),
+        "n_ok_prev_two": int(diag["prev_two_periods_also_valid"].sum()),
+        "max_hours": float(diag["period_hours"].max() or 0.0),
+    }
 
 
 def analyze_steady_state(
@@ -947,10 +1386,12 @@ def analyze_steady_state(
             df_TCC_w_sam_slice["TCC_id"].min(),
             df_TCC_w_sam_slice["TCC_id"].max(),
         )
-        for start_TCC_id in range(min_TCC_id, max_TCC_id - 2):  # type: ignore
-            # k = number of TCC per block
-            max_k: int = ((max_TCC_id - start_TCC_id + 1) - 2) // 3  # type: ignore
-            for k in range(1, max_k):
+        for start_TCC_id in range(int(min_TCC_id), int(max_TCC_id) + 1):
+            n_tcc = int(max_TCC_id) - start_TCC_id + 1
+            max_k = n_tcc // 3
+            if max_k < 1:
+                break
+            for k in range(1, max_k + 1):
                 s: int = start_TCC_id - min_TCC_id  # type: ignore
 
                 if (start_TCC_id, k) not in stats_cache:
@@ -978,6 +1419,18 @@ def analyze_steady_state(
                 stats["start_TCC_id"] = start_TCC_id
                 stats["N_TCC_per_block"] = k
                 all_stats_list.append(stats)
+
+    n_tcc = df_TCC_w_streaks_and_means.height
+    n_streaks = df_TCC_w_streaks_and_means["streak_id"].n_unique()
+    if not all_stats_list:
+        raise SS1NotFoundError(
+            "Geen SS1-perioden kunnen worden gevormd. "
+            f"{n_tcc} compressor-cyclus/cycli in {n_streaks} streak(s). "
+            "Een periode is 3 blokken van n cycli; na het weglaten van defrost-randen "
+            "zijn er te weinig aaneengesloten cycli (minstens 3).",
+            diagnostics=pl.DataFrame(),
+            summary={"n_periods": 0, "n_tcc": n_tcc, "n_streaks": n_streaks},
+        )
 
     # convert the all_stats_list to a dataframe
     df_all_possible_periods_w_stats = pl.from_dicts(
@@ -1062,6 +1515,21 @@ def analyze_steady_state(
     )
     # ss1_candidates.write_parquet("ss1_candidates.parquet")
     # print(ss1_candidates)
+    if ss1_candidates.height == 0:
+        diag = annotate_ss1_periods(df_all_possible_periods_w_stats)
+        summary = ss1_diagnostics_summary(diag)
+        raise SS1NotFoundError(
+            "Geen geldige SS1-periode gevonden. "
+            f"{summary.get('n_periods', 0)} kandidaat-periode(n): "
+            f"{summary.get('n_ok_duration', 0)} met duur ≥ 6 h, "
+            f"{summary.get('n_ok_temp_spread', 0)} met temp-spread < 0,25 K, "
+            f"{summary.get('n_ok_power_spread', 0)} met P-spread OK, "
+            f"{summary.get('n_ok_power_slope', 0)} met |P-helling| < 0,25 %/h, "
+            f"{summary.get('n_ok_prev_two', 0)} met geldige start−1/start−2. "
+            "Zie de tabel onder Validatie stabiele periode (SS1).",
+            diagnostics=diag,
+            summary=summary,
+        )
     opti = ss1_candidates.row(0, named=True)
     print(
         "SS1: n="

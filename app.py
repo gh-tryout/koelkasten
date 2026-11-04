@@ -26,10 +26,8 @@ from plotly.subplots import make_subplots
 import en62552
 import main as analysis
 
-# Streamlit herlaadt app.py, maar niet altijd lokale imports.
-# In een gebundelde exe is reload niet nodig en kan het stukgaan.
-if not getattr(sys, "frozen", False):
-    en62552 = reload(en62552)
+# Streamlit herlaadt app.py bij elke interactie. main/en62552 niet opnieuw
+# importeren: reload() voelt als een crash/herstart bij file-upload.
 
 
 def _project_dir() -> Path:
@@ -161,6 +159,7 @@ def _init_state() -> None:
     )
     st.session_state.setdefault("gradient_sensors", "110 (C), 206 (C)")
     st.session_state.setdefault("heater_advances_timer", False)
+    st.session_state.setdefault("defrost_power_w", 50.0)
     st.session_state.setdefault("tests", _default_tests())
     _migrate_tests(st.session_state["tests"])
     st.session_state.setdefault("active_test", 0)
@@ -182,6 +181,10 @@ def _init_state() -> None:
         "ss1_candidates",
         "ss2",
         "df1_details",
+        "ss1_diagnostics",
+        "ss1_diag_summary",
+        "view_df",
+        "view_key",
     ):
         st.session_state.setdefault(key, None)
 
@@ -203,6 +206,8 @@ def _clear_analysis() -> None:
         "ss1_candidates",
         "ss2",
         "df1_details",
+        "ss1_diagnostics",
+        "ss1_diag_summary",
     ):
         st.session_state[key] = None
 
@@ -427,6 +432,165 @@ def _plotly_power_temp(ss1: dict | None, zoom_ss1: bool) -> go.Figure | None:
     return fig
 
 
+def _logger_temp_columns(df: pl.DataFrame) -> list[str]:
+    skip = {
+        analysis.time_col,
+        analysis.val_col,
+        analysis.val_col_smooth_short,
+        analysis.val_col_smooth_long,
+        analysis.duration_col,
+        analysis.power_col,
+        "meas_duration",
+    }
+    cols = []
+    for name in df.columns:
+        if name in skip:
+            continue
+        if "(C)" in name or name.lower().startswith("temp"):
+            cols.append(name)
+    return cols
+
+
+def _compartment_sensor_names() -> dict[str, list[str]]:
+    mapping: dict[str, list[str]] = {}
+    for name, spec in analysis.compartments.items():
+        mapping[name] = list(spec.get("temp sensors") or [])
+    return mapping
+
+
+def _view_file_key(test: dict) -> tuple | None:
+    temp = test.get("temp_file") or ""
+    if not temp:
+        return None
+    temp_path = _resolve_temp_path(temp)
+    if not Path(temp_path).is_file():
+        return None
+    pool = _power_pool(test)
+    if not pool:
+        return None
+    matches = test.get("power_selected") or []
+    if not matches:
+        _sync_power_selection(test)
+        if test.get("power_select_error"):
+            return None
+        matches = test.get("power_selected") or []
+    matches = tuple(p for p in matches if Path(p).is_file())
+    if not matches:
+        return None
+    return (temp_path, matches)
+
+
+def _aligned_view_df(test: dict) -> pl.DataFrame:
+    """Aligned vermogen+temperatuur via load_and_align_data (geen TCC-analyse)."""
+    key = _view_file_key(test)
+    if key is None:
+        raise FileNotFoundError(
+            "Geen power- en temperatuurbestanden die bij deze meting passen. "
+            "Kies bestanden in het tabblad Meetpunten."
+        )
+    if st.session_state.get("view_key") == key and st.session_state.get("view_df") is not None:
+        return st.session_state["view_df"]
+    temp_path, matches = key
+    df = analysis.load_and_align_data(list(matches), temp_path).collect()
+    st.session_state["view_key"] = key
+    st.session_state["view_df"] = df
+    return df
+
+
+def _plotly_view_measurement(
+    df: pl.DataFrame,
+    extra_channels: list[str],
+) -> go.Figure:
+    time_c = analysis.time_col
+    p_col = analysis.power_col if analysis.power_col in df.columns else analysis.val_col
+    temp_cols = _logger_temp_columns(df)
+    comp_map = _compartment_sensor_names()
+    keep = [time_c]
+    if p_col in df.columns:
+        keep.append(p_col)
+    keep.extend(c for c in temp_cols if c in df.columns)
+    plot_df = _thin_df(df.select([c for c in keep if c in df.columns]).sort(time_c))
+    x = plot_df[time_c].to_list()
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.07,
+        subplot_titles=("Vermogen P", "Temperatuur T"),
+        row_heights=[0.42, 0.58],
+    )
+    if p_col in plot_df.columns:
+        fig.add_trace(
+            go.Scattergl(
+                x=x,
+                y=plot_df[p_col].to_list(),
+                name="P",
+                mode="lines",
+                line=dict(width=1.0, color="#c0392b"),
+                hovertemplate="%{x}<br>P=%{y:.3f} W<extra>P</extra>",
+            ),
+            row=1,
+            col=1,
+        )
+
+    for comp_name, sensors in comp_map.items():
+        present = [s for s in sensors if s in plot_df.columns]
+        if not present:
+            continue
+        if len(present) == 1:
+            series = plot_df[present[0]]
+        else:
+            series = plot_df.select(
+                pl.mean_horizontal([pl.col(s) for s in present]).alias("mean")
+            )["mean"]
+        fig.add_trace(
+            go.Scattergl(
+                x=x,
+                y=series.to_list(),
+                name=f"T {comp_name}",
+                mode="lines",
+                line=dict(width=1.4),
+                hovertemplate="%{x}<br>T "
+                + comp_name
+                + "=%{y:.3f} °C<extra>T "
+                + comp_name
+                + "</extra>",
+            ),
+            row=2,
+            col=1,
+        )
+
+    for col in extra_channels:
+        if col not in plot_df.columns:
+            continue
+        fig.add_trace(
+            go.Scattergl(
+                x=x,
+                y=plot_df[col].to_list(),
+                name=col,
+                mode="lines",
+                line=dict(width=1.0, dash="dot"),
+                hovertemplate="%{x}<br>" + col + "=%{y:.3f} °C<extra>" + col + "</extra>",
+            ),
+            row=2,
+            col=1,
+        )
+
+    fig.update_yaxes(title_text="W", row=1, col=1)
+    fig.update_yaxes(title_text="°C", row=2, col=1)
+    fig.update_xaxes(title_text="Tijd", row=2, col=1)
+    fig.update_layout(
+        height=720,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(l=50, r=20, t=40, b=40),
+        uirevision="view-meas-zoom",
+    )
+    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.06), row=2, col=1)
+    return fig
+
+
 def _render_ss2(test: dict | None) -> None:
     ss2 = (test or {}).get("ss2") or st.session_state.get("ss2")
     n_ev = (test or {}).get("n_defrost_events", 0)
@@ -593,9 +757,112 @@ def _render_ss2(test: dict | None) -> None:
                 )
 
 
+def _render_ss1_tcc_context() -> None:
+    """Als er geen 3-blok-perioden zijn: toon cycli/streaks zodat SS1-falen verklaarbaar is."""
+    means = st.session_state.get("df_TCC_w_streaks_and_means")
+    tcc = st.session_state.get("df_TCC")
+    summary = st.session_state.get("ss1_diag_summary") or {}
+    n_tcc = int(summary.get("n_tcc") or (0 if tcc is None else tcc.height))
+    n_streaks = int(summary.get("n_streaks") or 0)
+    st.markdown(
+        f"**Geen 3-blok-perioden gebouwd.** {n_tcc} compressorcyclus/cycli in "
+        f"{n_streaks or 'onbekend aantal'} streak(s). Een SS1-periode is drie "
+        "opeenvolgende blokken van n cycli; streaks van 1 cyclus (vaak omdat elke "
+        f"cyclus als ontdooi telt, drempel P > {float(st.session_state.get('defrost_power_w', 50.0)):g} W) vallen af. Na het weglaten van "
+        "de eerste twee en laatste TCC van een streak blijven er minstens 3 cycli nodig."
+    )
+    if means is None or getattr(means, "height", 0) == 0:
+        return
+    if "streak_id" in means.columns:
+        streak = (
+            means.group_by("streak_id")
+            .agg(
+                n_TCC=pl.len(),
+                n_defrost=(
+                    pl.col("is_defrost_cycle").sum()
+                    if "is_defrost_cycle" in means.columns
+                    else pl.lit(None)
+                ),
+                start=pl.col("TCC_start_datetime").min()
+                if "TCC_start_datetime" in means.columns
+                else pl.lit(None),
+                einde=pl.col("TCC_end_datetime").max()
+                if "TCC_end_datetime" in means.columns
+                else pl.lit(None),
+            )
+            .sort("streak_id")
+        )
+        st.dataframe(streak.to_pandas(), hide_index=True, width="stretch")
+    show = [
+        c
+        for c in (
+            "TCC_id",
+            "streak_id",
+            "TCC_start_datetime",
+            "TCC_duration",
+            "TCC_on_duration",
+            analysis.power_col,
+            "is_defrost_cycle",
+        )
+        if c in means.columns
+    ]
+    if show:
+        st.caption("Alle gedetecteerde TCC’s")
+        st.dataframe(means.select(show).to_pandas(), hide_index=True, width="stretch")
+
+
+def _ss1_diag_display(diag) -> None:
+    if diag is None or getattr(diag, "height", 0) == 0:
+        _render_ss1_tcc_context()
+        return
+    summary = st.session_state.get("ss1_diag_summary") or {}
+    n = summary.get("n_periods", diag.height)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Kandidaten", str(n))
+    c2.metric("Duur ≥ 6 h", str(summary.get("n_ok_duration", "—")))
+    c3.metric("Temp-spread OK", str(summary.get("n_ok_temp_spread", "—")))
+    c4.metric("|P-helling| OK", str(summary.get("n_ok_power_slope", "—")))
+    c5.metric("Start−1/−2 OK", str(summary.get("n_ok_prev_two", "—")))
+    pdf = diag.head(80).to_pandas()
+    rows = []
+    for rec in pdf.to_dict("records"):
+        rows.append(
+            {
+                "Start TCC": rec.get("start_TCC_id"),
+                "n / blok": rec.get("N_TCC_per_block"),
+                "Aantal TCC": rec.get("n_TCC"),
+                "Duur (h)": round(float(rec.get("period_hours") or 0), 3),
+                "P gem. (W)": round(float(rec.get("power_avg") or 0), 3),
+                "P-spread (%)": round(float(rec.get("power_spread_pct") or 0), 3),
+                "P-limiet (%)": round(float(rec.get("power_spread_limit_pct") or 0), 3),
+                "P-helling (%/h)": round(float(rec.get("power_slope_pct") or 0), 4),
+                "T-spread max (K)": (
+                    None
+                    if rec.get("max_temp_spread_K") is None
+                    else round(float(rec.get("max_temp_spread_K")), 4)
+                ),
+                "T-helling max (K/h)": (
+                    None
+                    if rec.get("max_temp_slope_K_per_h") is None
+                    else round(float(rec.get("max_temp_slope_K_per_h")), 4)
+                ),
+                "SS1": "ja" if rec.get("ok_ss1") else "nee",
+                "Waarom niet": rec.get("fail_reason") or "",
+            }
+        )
+    st.dataframe(rows, hide_index=True, width="stretch")
+    st.caption(
+        "Eis: duur ≥ 6 h, temp-spread < 0,25 K, |P-helling| < 0,25 %/h, "
+        "P-spread volgens duurklasse, en de perioden die 1 en 2 TCC eerder starten "
+        "moeten ook aan die eisen voldoen. Maximaal 80 rijen, best-eerst."
+    )
+
+
 def _render_ss1_decision() -> None:
     ss1 = st.session_state.get("ss1_opti")
     if not ss1:
+        st.markdown("**Waarom SS1 niet is gehaald**")
+        _ss1_diag_display(st.session_state.get("ss1_diagnostics"))
         return
     n = int(ss1.get("N_TCC_per_block") or 0)
     start = int(ss1.get("start_TCC_id") or 0)
@@ -790,9 +1057,34 @@ def _save_uploaded(files, dest_dir: Path) -> list[Path]:
     for uploaded in files:
         name = Path(uploaded.name).name or "bestand.csv"
         target = dest_dir / name
-        target.write_bytes(uploaded.getbuffer())
+        target.write_bytes(uploaded.getvalue())
         saved.append(target)
     return saved
+
+
+def _save_uploaded_power(files, dest_dir: Path) -> list[Path]:
+    """CSV’s of één zip van de power-map; .CSV blijft behouden."""
+    import zipfile
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    zips = [f for f in files if Path(f.name).suffix.lower() == ".zip"]
+    if len(zips) == 1 and len(files) == 1:
+        for old in dest_dir.iterdir():
+            if old.is_file():
+                old.unlink()
+        with zipfile.ZipFile(io.BytesIO(zips[0].getvalue())) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                name = Path(info.filename).name
+                if name.startswith(".") or not name:
+                    continue
+                if Path(name).suffix.lower() not in {".csv", ".txt", ".dat"}:
+                    continue
+                target = dest_dir / name
+                target.write_bytes(zf.read(info))
+        return list(dest_dir.iterdir())
+    return _save_uploaded(files, dest_dir)
 
 
 def _pick_local_files(*, multiple: bool, title: str) -> list[str]:
@@ -837,32 +1129,84 @@ def _pick_local_directory(title: str) -> str | None:
         return None
 
 
-def _power_matches(test: dict) -> list[str]:
+def _list_power_files(paths: list[str] | str) -> list[str]:
+    if isinstance(paths, str):
+        folder = Path(paths)
+        if folder.is_dir():
+            found = []
+            for pat in ("*.CSV", "*.csv", "*.txt", "*.dat"):
+                found.extend(str(p) for p in folder.glob(pat) if p.is_file())
+            return sorted(set(found))
+        found = glob.glob(paths)
+        if not found and not Path(paths).is_absolute():
+            found = glob.glob(str(PROJECT_DIR / paths))
+        return sorted(found)
+    files: list[str] = []
+    for p in paths:
+        path = Path(p)
+        if path.is_dir():
+            files.extend(_list_power_files(str(path)))
+        elif path.is_file():
+            files.append(str(path))
+    return sorted(set(files))
+
+
+def _power_pool(test: dict) -> list[str]:
+    pool = test.get("power_pool")
+    if pool:
+        return [p for p in pool if Path(p).is_file()]
+    return _list_power_files(_power_matches_raw(test))
+
+
+def _power_matches_raw(test: dict) -> list[str]:
     paths = test.get("power_paths")
     if paths:
         return [p for p in paths if Path(p).is_file()]
     pattern = test.get("power_glob") or ""
     if not pattern:
         return []
-    found = glob.glob(pattern)
-    if not found and not Path(pattern).is_absolute():
-        found = glob.glob(str(PROJECT_DIR / pattern))
-    return found
+    return _list_power_files(pattern)
+
+
+def _power_matches(test: dict) -> list[str]:
+    return _power_pool(test)
 
 
 def _power_arg(test: dict) -> str | list[str]:
-    matches = _power_matches(test)
+    matches = test.get("power_selected") or _power_matches(test)
+    matches = [p for p in matches if Path(p).is_file()]
     return matches if matches else (test.get("power_glob") or "")
 
 
+def _sync_power_selection(test: dict) -> None:
+    test.pop("power_select_error", None)
+    pool = _power_pool(test)
+    temp = test.get("temp_file") or ""
+    temp_path = _resolve_temp_path(temp) if temp else ""
+    if not pool or not temp_path or not Path(temp_path).is_file():
+        test["power_selected"] = []
+        return
+    try:
+        chosen = analysis.select_power_files_for_temp(pool, temp_path)
+    except Exception as exc:
+        test["power_selected"] = []
+        test["power_select_error"] = str(exc)
+        return
+    test["power_selected"] = chosen
+    tmin, tmax = analysis.temp_file_span(temp_path)
+    test["temp_span"] = (str(tmin), str(tmax))
+
+
 def _apply_power_paths(test: dict, paths: list[str], index: int | None = None) -> None:
-    files = [str(Path(p)) for p in paths if Path(p).is_file()]
+    files = _list_power_files(paths)
+    test["power_pool"] = files
     test["power_paths"] = files
     if files:
         folder = Path(files[0]).parent
         test["power_glob"] = str(folder / "*")
-        if index is not None:
+        if index is not None and f"p_{index}" in st.session_state:
             st.session_state[f"p_{index}"] = test["power_glob"]
+    _sync_power_selection(test)
 
 
 def _render_test_files(test: dict, index: int) -> None:
@@ -883,26 +1227,53 @@ def _render_test_files(test: dict, index: int) -> None:
         st.caption("Deze sessie is op afstand: kies de CSV’s via uploaden.")
 
     if mode == "upload":
+        st.caption(
+            "Yokogawa-files heten `.CSV` (hoofdletters). Die werden door de browser "
+            "als ongeldig (rood) geweigerd. Alle extensies zijn nu toegestaan. "
+            "Zeven files van ~14 MB kunnen de Preview-verbinding kappen; liever een "
+            "zip, of een map die al op de server staat."
+        )
+        server_dirs = sorted(
+            p.name
+            for p in UPLOAD_ROOT.iterdir()
+            if p.is_dir() and (p / "power").is_dir()
+        ) if UPLOAD_ROOT.is_dir() else []
+        if server_dirs:
+            pick = st.selectbox(
+                "Al aanwezige map op de server",
+                options=["(zelf uploaden)"] + server_dirs,
+                key=f"server_map_{index}",
+            )
+            if pick != "(zelf uploaden)":
+                folder = UPLOAD_ROOT / pick / "power"
+                files = _list_power_files(str(folder))
+                if files and test.get("power_pool") != files:
+                    _apply_power_paths(test, files, index)
+                temp_dir = UPLOAD_ROOT / pick / "temp"
+                temps = _list_power_files(str(temp_dir)) if temp_dir.is_dir() else []
+                if temps and not test.get("temp_file"):
+                    test["temp_file"] = temps[0]
+                    _sync_power_selection(test)
         power_up = st.file_uploader(
-            "Power-CSV’s",
-            type=["csv", "txt", "dat"],
+            "Power-CSV’s of één zip (geen extensiefilter)",
+            type=None,
             accept_multiple_files=True,
             key=f"power_up_{index}",
-            help="Eén of meer vermogensbestanden van de logger.",
+            help="Alle bestanden, ook .CSV. Of één .zip van de power-map.",
         )
         if power_up:
             sig = tuple((f.name, f.size) for f in power_up)
             if test.get("_power_upload_sig") != sig:
-                saved = _save_uploaded(
-                    power_up, UPLOAD_ROOT / _safe_id(test["id"]) / "power"
-                )
+                dest = UPLOAD_ROOT / _safe_id(test["id"]) / "power"
+                saved = _save_uploaded_power(power_up, dest)
                 _apply_power_paths(test, [str(p) for p in saved], index)
                 test["_power_upload_sig"] = sig
         temp_up = st.file_uploader(
             "Temperatuur-CSV",
-            type=["csv", "txt", "dat"],
+            type=None,
             accept_multiple_files=False,
             key=f"temp_up_{index}",
+            help="Ook .CSV (hoofdletters) is toegestaan.",
         )
         if temp_up is not None:
             sig = (temp_up.name, temp_up.size)
@@ -912,8 +1283,10 @@ def _render_test_files(test: dict, index: int) -> None:
                 )
                 if saved:
                     test["temp_file"] = str(saved[0])
-                    st.session_state[f"t_{index}"] = test["temp_file"]
+                    if f"t_{index}" in st.session_state:
+                        st.session_state[f"t_{index}"] = test["temp_file"]
                     test["_temp_upload_sig"] = sig
+                    _sync_power_selection(test)
     else:
         p1, p2 = st.columns(2)
         if p1.button("Power-bestanden kiezen…", key=f"pick_p_{index}"):
@@ -925,12 +1298,9 @@ def _render_test_files(test: dict, index: int) -> None:
                 test.pop("_power_upload_sig", None)
                 st.rerun()
         if p2.button("Power-map kiezen…", key=f"pick_pd_{index}"):
-            folder = _pick_local_directory("Map met power-bestanden")
+            folder = _pick_local_directory("Map met alle power-bestanden")
             if folder:
-                csvs = sorted(Path(folder).glob("*.csv"))
-                files = [str(p) for p in csvs] or [
-                    str(p) for p in Path(folder).iterdir() if p.is_file()
-                ]
+                files = _list_power_files(folder)
                 if files:
                     _apply_power_paths(test, files, index)
                     test.pop("_power_upload_sig", None)
@@ -943,36 +1313,63 @@ def _render_test_files(test: dict, index: int) -> None:
             )
             if chosen:
                 test["temp_file"] = chosen[0]
-                st.session_state[f"t_{index}"] = chosen[0]
+                if f"t_{index}" in st.session_state:
+                    st.session_state[f"t_{index}"] = chosen[0]
                 test.pop("_temp_upload_sig", None)
+                _sync_power_selection(test)
                 st.rerun()
 
-    matches = _power_matches(test)
-    if matches:
-        st.caption(f"{len(matches)} power-bestand(en): " + ", ".join(Path(p).name for p in matches[:8])
-                   + ("…" if len(matches) > 8 else ""))
+    pool = _power_pool(test)
+    selected = [p for p in (test.get("power_selected") or []) if Path(p).is_file()]
+    if pool:
+        st.caption(
+            f"{len(pool)} power-bestand(en) in de map"
+            + (
+                f", automatisch {len(selected)} gekozen bij de temperatuurmeting: "
+                + ", ".join(Path(p).name for p in selected[:8])
+                + ("…" if len(selected) > 8 else "")
+                if selected
+                else ""
+            )
+        )
     else:
-        st.caption("Nog geen power-bestanden gekozen.")
+        st.caption("Nog geen power-bestanden gekozen. Zet alle powermetingen in één map.")
+    if test.get("power_select_error"):
+        st.warning(test["power_select_error"])
     temp_ok = Path(_resolve_temp_path(test.get("temp_file") or "")).is_file() if test.get("temp_file") else False
     if temp_ok:
-        st.caption(f"Temperatuur: {Path(test['temp_file']).name}")
+        span = test.get("temp_span")
+        extra = f" ({span[0]} – {span[1]})" if span else ""
+        st.caption(f"Temperatuur: {Path(test['temp_file']).name}{extra}")
     else:
         st.caption("Nog geen temperatuurbestand gekozen.")
 
     with st.expander("Handmatig pad (optioneel)"):
+        p_key, t_key = f"p_{index}", f"t_{index}"
+        if p_key not in st.session_state:
+            st.session_state[p_key] = test.get("power_glob") or ""
+        if t_key not in st.session_state:
+            st.session_state[t_key] = test.get("temp_file") or ""
         new_glob = st.text_input(
             "Power-bestanden (glob of map\\*)",
-            test.get("power_glob") or "",
-            key=f"p_{index}",
+            key=p_key,
         )
         if new_glob != (test.get("power_glob") or ""):
             test.pop("power_paths", None)
-        test["power_glob"] = new_glob
-        test["temp_file"] = st.text_input(
+            test["power_pool"] = _list_power_files(new_glob) if new_glob else []
+            test["power_glob"] = new_glob
+            _sync_power_selection(test)
+        else:
+            test["power_glob"] = new_glob
+        new_temp = st.text_input(
             "Temperatuur-CSV",
-            test.get("temp_file") or "",
-            key=f"t_{index}",
+            key=t_key,
         )
+        if new_temp != (test.get("temp_file") or ""):
+            test["temp_file"] = new_temp
+            _sync_power_selection(test)
+        else:
+            test["temp_file"] = new_temp
 
 
 def apply_appliance_config() -> dict:
@@ -1000,7 +1397,12 @@ def apply_appliance_config() -> dict:
         }
     amb = [s.strip() for s in st.session_state["ambient_sensors"].split(",") if s.strip()]
     grad = [s.strip() for s in st.session_state["gradient_sensors"].split(",") if s.strip()]
-    analysis.configure_appliance(new, ambient_sensors=amb, gradient_sensors=grad)
+    analysis.configure_appliance(
+        new,
+        ambient_sensors=amb,
+        gradient_sensors=grad,
+        defrost_power_w=float(st.session_state.get("defrost_power_w", 50.0)),
+    )
     st.session_state["compartments_ui"] = rows
     return new
 
@@ -1497,13 +1899,23 @@ def collected_points() -> list[en62552.TestPoint]:
 def run_full_test(test: dict) -> None:
     _clear_analysis()
     apply_appliance_config()
-    power_arg = _power_arg(test)
     temp_path = _resolve_temp_path(test.get("temp_file") or "")
     if not Path(temp_path).is_file():
         raise FileNotFoundError(f"Temperatuurbestand niet gevonden: {temp_path}")
-    matches = power_arg if isinstance(power_arg, list) else glob.glob(str(power_arg))
+    pool = _power_pool(test)
+    if not pool:
+        raise FileNotFoundError(
+            "Geen power-bestanden gevonden. Zet alle powermetingen in één map en kies die map."
+        )
+    _sync_power_selection(test)
+    if test.get("power_select_error"):
+        raise ValueError(test["power_select_error"])
+    matches = test.get("power_selected") or []
     if not matches:
-        raise FileNotFoundError("Geen power-bestanden gevonden. Upload of selecteer CSV’s.")
+        raise FileNotFoundError(
+            "Geen power-bestanden die bij de tijdspanne van de temperatuurmeting passen."
+        )
+    power_arg = matches
 
     lf = _run_with_log(lambda: analysis.load_and_align_data(power_arg, temp_path))
     df = lf.collect()
@@ -1516,18 +1928,28 @@ def run_full_test(test: dict) -> None:
     }
 
     df_TCC, df_means, df_meas, plot_data = _run_with_log(
-        lambda: analysis.detect_tcc_cycles(df.lazy(), make_plots=False)
+        lambda: analysis.detect_tcc_cycles(
+            df.lazy(),
+            make_plots=False,
+            defrost_power_w=float(st.session_state.get("defrost_power_w", 50.0)),
+        )
     )
     st.session_state["df_TCC"] = df_TCC
     st.session_state["df_TCC_w_streaks_and_means"] = df_means
     st.session_state["df_meas_data_w_smooth_w_TCC_id"] = df_meas
     st.session_state["plot_data"] = plot_data
 
-    ss1_result = _run_with_log(
-        lambda: analysis.analyze_steady_state(
-            df_means, nominal_ambient=float(test["ambient_c"])
+    try:
+        ss1_result = _run_with_log(
+            lambda: analysis.analyze_steady_state(
+                df_means, nominal_ambient=float(test["ambient_c"])
+            )
         )
-    )
+    except analysis.SS1NotFoundError as exc:
+        st.session_state["ss1_diagnostics"] = exc.diagnostics
+        st.session_state["ss1_diag_summary"] = exc.summary
+        st.session_state["df_all_possible_periods_w_stats"] = exc.diagnostics
+        raise
     if len(ss1_result) == 5:
         ss1_opti, pss, df_periods, mean_amb_temp, ss1_candidates = ss1_result
     else:
@@ -1538,6 +1960,13 @@ def run_full_test(test: dict) -> None:
     st.session_state["df_all_possible_periods_w_stats"] = df_periods
     st.session_state["mean_amb_temp"] = mean_amb_temp
     st.session_state["ss1_candidates"] = ss1_candidates
+    try:
+        st.session_state["ss1_diagnostics"] = analysis.annotate_ss1_periods(df_periods)
+        st.session_state["ss1_diag_summary"] = analysis.ss1_diagnostics_summary(
+            st.session_state["ss1_diagnostics"]
+        )
+    except Exception:
+        st.session_state["ss1_diagnostics"] = None
 
     defrost_result = _run_with_log(
         lambda: analysis.analyze_defrost(df_means, df_periods, df_meas)
@@ -1636,11 +2065,12 @@ flash = st.session_state.pop("flash", None)
 if flash:
     st.success(flash)
 
-tab_need, tab_appliance, tab_tests, tab_analyse, tab_combine, tab_log = st.tabs(
+tab_need, tab_appliance, tab_tests, tab_view, tab_analyse, tab_combine, tab_log = st.tabs(
     [
         "Wat is nodig",
         "Toestel",
         "Meetpunten",
+        "Bekijk meting",
         "Analyse één meting",
         "Interpolatie & jaarverbruik",
         "Log",
@@ -1750,6 +2180,15 @@ with tab_appliance:
         "Als de CV van Δtrt ≥ 10 % waarschuwt het programma dat het geen CRT-regelaar lijkt "
         "(elapsed-time of variable/demand-defrost)."
     )
+    st.number_input(
+        "Ontdooi als vermogen P groter is dan (W)",
+        min_value=0.0,
+        max_value=5000.0,
+        step=5.0,
+        format="%.1f",
+        key="defrost_power_w",
+        help="Een TCC telt als ontdooi-cyclus als er ergens in die cyclus P boven deze drempel komt. Standaard 50 W. Zet hoger als normale compressor-aan al boven 50 W zit.",
+    )
     st.checkbox(
         "Timer loopt door tijdens ontdooiverwarming (Δtdh > 0) — nog niet gemeten, alleen ter info",
         key="heater_advances_timer",
@@ -1844,6 +2283,10 @@ with tab_tests:
                         run_full_test(test)
                     st.session_state["flash"] = f"Meetpunt '{test['name']}' geanalyseerd."
                     st.rerun()
+                except analysis.SS1NotFoundError as exc:
+                    st.error(str(exc))
+                    st.markdown("### Validatie stabiele periode (SS1)")
+                    _render_ss1_decision()
                 except Exception as exc:
                     st.error(str(exc))
             if cols[1].button("Verwijderen", key=f"del_{i}"):
@@ -1873,6 +2316,115 @@ with tab_tests:
         file_name="campagne_en62552.json",
         mime="application/json",
     )
+
+with tab_view:
+    st.subheader("Bekijk meting")
+    st.caption(
+        "Vermogen en temperaturen van de gekozen meting op de uitgelijnde tijdreeks "
+        "(dezelfde samples als na load_and_align_data). Niet alleen TCC-startpunten — "
+        "daardoor blijft T zichtbaar tot het einde van de overlap, ook na de laatste complete cyclus."
+    )
+    tests = st.session_state["tests"]
+    if not tests:
+        st.info("Voeg eerst een meetpunt toe in het tabblad Meetpunten.")
+    else:
+        idx_default = st.session_state.get("active_test", 0)
+        if not (0 <= idx_default < len(tests)):
+            idx_default = 0
+        chosen = st.selectbox(
+            "Gekozen meting",
+            options=list(range(len(tests))),
+            index=idx_default,
+            format_func=lambda i: (
+                f"{tests[i]['name']}  ({tests[i]['ambient_c']} °C, "
+                f"{VS_TARGET_OPTIONS.get(tests[i].get('vs_target', 'onder'), tests[i].get('vs_target'))})"
+            ),
+            key="view_test_select",
+        )
+        st.session_state["active_test"] = chosen
+        test = tests[chosen]
+        try:
+            apply_appliance_config()
+        except Exception as exc:
+            st.warning(f"Toestelconfiguratie: {exc}")
+
+        if _view_file_key(test) is None:
+            err = test.get("power_select_error")
+            if err:
+                st.error(err)
+            else:
+                st.info(
+                    "Kies power- en temperatuurbestanden voor dit meetpunt in het tabblad Meetpunten."
+                )
+        else:
+            try:
+                with st.spinner("Meting laden en uitlijnen…"):
+                    df_view = _aligned_view_df(test)
+            except Exception as exc:
+                st.error(str(exc))
+            else:
+                tmin = df_view[analysis.time_col].min()
+                tmax = df_view[analysis.time_col].max()
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Rijen (uitgelijnd)", f"{df_view.height:,}".replace(",", "."))
+                m2.metric("Start", str(tmin))
+                m3.metric("Einde", str(tmax))
+
+                logger_cols = _logger_temp_columns(df_view)
+                extra_cols = list(logger_cols)
+                missing_comp = [
+                    name
+                    for name, sensors in _compartment_sensor_names().items()
+                    if not any(s in df_view.columns for s in sensors)
+                ]
+                if missing_comp:
+                    st.warning(
+                        "Geen sensoren in de meting voor: " + ", ".join(missing_comp)
+                    )
+                st.markdown("**Compartimenttemperaturen (standaard)**")
+                shown = []
+                for name, sensors in _compartment_sensor_names().items():
+                    present = [s for s in sensors if s in df_view.columns]
+                    if present:
+                        shown.append(f"{name}: {', '.join(present)}")
+                st.caption(
+                    "Gemiddelde van de compartimentsensoren uit de toestelconfiguratie. "
+                    + (" · ".join(shown) if shown else "Geen compartimentsensoren gevonden.")
+                )
+
+                extra_selected: list[str] = []
+                if extra_cols:
+                    st.markdown("**Extra temperatuurkanalen**")
+                    st.caption(
+                        "Standaard uit. Vink individuele loggerkanalen aan "
+                        "(compartiment, omgeving, gradiënt) om alle temperaturen te zien."
+                    )
+                    show_all_extra = st.checkbox(
+                        "Toon alle extra kanalen",
+                        value=False,
+                        key="view_all_extra_temps",
+                    )
+                    if show_all_extra:
+                        extra_selected = list(extra_cols)
+                        st.caption(", ".join(extra_cols))
+                    else:
+                        boxes = st.columns(3)
+                        for i, col in enumerate(extra_cols):
+                            if boxes[i % 3].checkbox(col, value=False, key=f"view_temp_{col}"):
+                                extra_selected.append(col)
+                else:
+                    st.caption("Geen extra loggerkanalen naast de compartimentsensoren.")
+
+                fig_view = _plotly_view_measurement(df_view, extra_selected)
+                st.plotly_chart(
+                    fig_view,
+                    width="stretch",
+                    config={
+                        "scrollZoom": True,
+                        "displaylogo": False,
+                        "modeBarButtonsToAdd": ["select2d", "lasso2d"],
+                    },
+                )
 
 with tab_analyse:
     st.subheader("Laatst geanalyseerde meting")
