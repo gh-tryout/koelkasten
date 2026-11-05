@@ -536,6 +536,7 @@ def _detect_csv_separator(path: str) -> str:
 
 
 POWER_TIME_SLACK = timedelta(hours=6)
+POWER_GAP_LIMIT = timedelta(seconds=30)
 
 
 def _decode_text_sample(raw: bytes, encoding: str | None = None) -> str:
@@ -698,6 +699,74 @@ def select_power_files_for_temp(
     filled = [(p, a, b) for p, a, b in spans if b >= cmin and a <= cmax]
     filled.sort(key=lambda x: x[1])
     return [p for p, _, _ in filled]
+
+
+def power_file_gaps(
+    paths: list[str],
+    min_gap: timedelta | None = None,
+) -> list[dict]:
+    """Gaten tussen opeenvolgende power-CSV’s (einde bestand i tot start bestand i+1)."""
+    min_gap = min_gap if min_gap is not None else POWER_GAP_LIMIT
+    spans: list[tuple[str, datetime, datetime]] = []
+    for path in paths:
+        span = power_file_span(path)
+        if span is None:
+            continue
+        spans.append((path, span[0], span[1]))
+    spans.sort(key=lambda x: x[1])
+    gaps: list[dict] = []
+    for (p0, _a0, b0), (p1, a1, _b1) in zip(spans, spans[1:]):
+        gap = a1 - b0
+        if gap > min_gap:
+            gaps.append(
+                {
+                    "bron": "bestanden",
+                    "na_bestand": Path(p0).name,
+                    "voor_bestand": Path(p1).name,
+                    "einde": b0,
+                    "start": a1,
+                    "duur_s": gap.total_seconds(),
+                }
+            )
+    return gaps
+
+
+def datetime_series_gaps(
+    times,
+    min_gap: timedelta | None = None,
+    sample_limit: timedelta | None = None,
+) -> list[dict]:
+    """Gaten in een gesorteerde datetime-reeks (uitgelijnde powermeting)."""
+    min_gap = min_gap if min_gap is not None else POWER_GAP_LIMIT
+    seq = list(times)
+    if len(seq) < 2:
+        return []
+    diffs: list[float] = []
+    for a, b in zip(seq, seq[1:]):
+        if a is None or b is None:
+            continue
+        diffs.append((b - a).total_seconds())
+    if not diffs:
+        return []
+    diffs_sorted = sorted(diffs)
+    median_s = diffs_sorted[len(diffs_sorted) // 2]
+    limit_s = min_gap.total_seconds()
+    if sample_limit is not None:
+        limit_s = max(limit_s, sample_limit.total_seconds())
+    elif median_s > 0:
+        limit_s = max(limit_s, 5.0 * median_s)
+    gaps: list[dict] = []
+    for a, b, dt_s in zip(seq, seq[1:], diffs):
+        if dt_s > limit_s:
+            gaps.append(
+                {
+                    "bron": "samples",
+                    "einde": a,
+                    "start": b,
+                    "duur_s": dt_s,
+                }
+            )
+    return gaps
 
 
 _WATTMETER_PREFIX = re.compile(r"^WT\d+:")
