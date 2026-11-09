@@ -861,15 +861,8 @@ def _temp_csv_header_skip(path: str, encoding: str) -> int:
     )
 
 
-def load_and_align_data(
-    power_files: str | list[str],
-    temp_file: str,
-) -> pl.LazyFrame:
-    """Lees stroom- en temperatuurdata in, align op tijd en interpolatie ontbrekende waarden.
-
-    De CSV-scans, de join en de interpolatie blijven een Polars LazyFrame tot de caller
-    materialiseert. Temperatuurdata wordt eager gelezen vanwege UTF-16, daarna direct lazy.
-    """
+def load_power_data(power_files: str | list[str]) -> pl.LazyFrame:
+    """Lees wattmeter-CSV’s als LazyFrame met Datetime en P-1, zonder temperatuur."""
     sep = _detect_csv_separator(_first_existing_path(power_files))
     lf_power = pl.scan_csv(power_files, infer_schema=False, separator=sep)
     names = lf_power.collect_schema().names()
@@ -897,11 +890,23 @@ def load_and_align_data(
         .drop(drop_power)
     )
     lf_power = _normalize_wattmeter_columns(lf_power)
-    lf_power = (
+    return (
         lf_power.drop_nulls(subset=[time_col, power_col])
         .select([time_col, cs.all().exclude(time_col)])
         .sort(time_col)
     )
+
+
+def load_and_align_data(
+    power_files: str | list[str],
+    temp_file: str,
+) -> pl.LazyFrame:
+    """Lees stroom- en temperatuurdata in, align op tijd en interpolatie ontbrekende waarden.
+
+    De CSV-scans, de join en de interpolatie blijven een Polars LazyFrame tot de caller
+    materialiseert. Temperatuurdata wordt eager gelezen vanwege UTF-16, daarna direct lazy.
+    """
+    lf_power = load_power_data(power_files)
     power_span = lf_power.select(
         pl.col(time_col).min().alias("tmin"),
         pl.col(time_col).max().alias("tmax"),

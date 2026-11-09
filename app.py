@@ -68,6 +68,17 @@ _KIND_NL = {
     "variable": "variable/demand-defrost",
     "onvoldoende_data": "onvoldoende data",
 }
+NAV_TABS = [
+    ("need", "Wat is nodig"),
+    ("appliance", "Toestel"),
+    ("tests", "Meetpunten"),
+    ("view", "Bekijk meting"),
+    ("analyse", "Analyse één meting"),
+    ("defrost", "Defrost"),
+    ("combine", "Interpolatie & jaarverbruik"),
+    ("log", "Log"),
+]
+NAV_LABELS = dict(NAV_TABS)
 _TESTPOINT_FIELDS = {f.name for f in fields(en62552.TestPoint)}
 _SETTINGS_VERSION = 2
 
@@ -92,6 +103,7 @@ def _blank_test(
         "n_defrost_events": 0,
         "defrost_events": [],
         "power_gaps": [],
+        "defrost_provisional": False,
         "vs_target_warning": None,
         "ss2": None,
     }
@@ -153,6 +165,7 @@ def _migrate_tests(tests: list[dict]) -> None:
         t.setdefault("n_defrost_events", 0)
         t.setdefault("defrost_events", [])
         t.setdefault("power_gaps", [])
+        t.setdefault("defrost_provisional", False)
         t.setdefault("temp_folder", "")
         t.setdefault("vs_target_warning", None)
         t.setdefault("ss2", None)
@@ -183,8 +196,10 @@ def _init_state() -> None:
     st.session_state.setdefault("tests", _default_tests())
     _migrate_tests(st.session_state["tests"])
     st.session_state.setdefault("active_test", 0)
+    st.session_state.setdefault("nav_tab", "need")
     st.session_state.setdefault("flash", None)
     st.session_state.setdefault("log", "")
+    st.session_state.setdefault("analyse_error", None)
     for key in (
         "lf_meas_data",
         "load_info",
@@ -205,6 +220,8 @@ def _init_state() -> None:
         "ss1_diag_summary",
         "view_df",
         "view_key",
+        "view_power_df",
+        "view_power_key",
     ):
         st.session_state.setdefault(key, None)
     st.session_state.setdefault("power_folder", "")
@@ -612,6 +629,120 @@ def _plotly_view_measurement(
     )
     fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.06), row=2, col=1)
     return fig
+
+
+def _continuous_power_df() -> pl.DataFrame:
+    pool = _campaign_power_pool()
+    if not pool:
+        raise FileNotFoundError("Geen power-map gekozen.")
+    key = tuple(pool)
+    if st.session_state.get("view_power_key") == key and st.session_state.get("view_power_df") is not None:
+        return st.session_state["view_power_df"]
+    lf = analysis.load_power_data(pool)
+    df = (
+        lf.select(analysis.time_col, analysis.power_col)
+        .sort(analysis.time_col)
+        .collect()
+    )
+    st.session_state["view_power_key"] = key
+    st.session_state["view_power_df"] = df
+    return df
+
+
+def _plotly_continuous_power(
+    df: pl.DataFrame,
+    tests: list[dict],
+    threshold: float | None,
+) -> go.Figure:
+    time_c = analysis.time_col
+    p_col = analysis.power_col if analysis.power_col in df.columns else analysis.val_col
+    plot_df = _thin_df(df.select([c for c in (time_c, p_col) if c in df.columns]).sort(time_c), n_max=25000)
+    x = plot_df[time_c].to_list()
+    fig = make_subplots(
+        rows=1,
+        cols=1,
+        subplot_titles=("Doorlopende vermogensmeting (alle bestanden)",),
+    )
+    if p_col in plot_df.columns:
+        fig.add_trace(
+            go.Scattergl(
+                x=x,
+                y=plot_df[p_col].to_list(),
+                name="P",
+                mode="lines",
+                line=dict(width=0.9, color="#c0392b"),
+                hovertemplate="%{x}<br>P=%{y:.3f} W<extra>P</extra>",
+            )
+        )
+        if threshold is not None:
+            hi = plot_df.filter(pl.col(p_col) > float(threshold))
+            if hi.height:
+                hi = _thin_df(hi, n_max=8000)
+                fig.add_trace(
+                    go.Scattergl(
+                        x=hi[time_c].to_list(),
+                        y=hi[p_col].to_list(),
+                        name=f"P > {threshold:g} W (defrost?)",
+                        mode="markers",
+                        marker=dict(size=5, color="#f39c12"),
+                        hovertemplate="%{x}<br>P=%{y:.3f} W<extra>boven drempel</extra>",
+                    )
+                )
+            fig.add_hline(
+                y=float(threshold),
+                line_dash="dash",
+                line_color="#1e8449",
+                annotation_text="ontdooi-drempel",
+            )
+    colors = ["#5dade2", "#58d68d", "#f5b041", "#af7ac5", "#e74c3c", "#1abc9c"]
+    for i, test in enumerate(tests):
+        span = test.get("temp_span")
+        if not span or len(span) < 2:
+            continue
+        fig.add_vrect(
+            x0=span[0],
+            x1=span[1],
+            fillcolor=colors[i % len(colors)],
+            opacity=0.16,
+            line_width=0,
+            annotation_text=test.get("name") or f"meting {i + 1}",
+            annotation_position="top left",
+        )
+    fig.update_yaxes(title_text="W")
+    fig.update_xaxes(title_text="Tijd")
+    fig.update_layout(
+        height=560,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(l=50, r=20, t=50, b=40),
+        uirevision="view-power-zoom",
+    )
+    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.08))
+    return fig
+
+
+def _defrost_daily_kwh(delta_edf_wh: float | None, delta_tdf_h: float | None) -> float | None:
+    if not delta_edf_wh or not delta_tdf_h or delta_tdf_h <= 0:
+        return None
+    return 24.0 * float(delta_edf_wh) / float(delta_tdf_h) / 1000.0
+
+
+def _render_provisional_defrost(test: dict | None, point: dict | None = None) -> None:
+    test = test or {}
+    point = point or test.get("point") or {}
+    if not test.get("defrost_provisional"):
+        return
+    daily = _defrost_daily_kwh(point.get("delta_edf_wh"), point.get("delta_tdf_h"))
+    edf = point.get("delta_edf_wh")
+    tdf = point.get("delta_tdf_h")
+    parts = ["**Voorlopige waarde** — aanname: het volgende ontdooi-interval is gelijk aan het gemeten interval."]
+    if edf:
+        parts.append(f"ΔEdf = {float(edf):.2f} Wh")
+    if tdf:
+        parts.append(f"Δtdf = {float(tdf):.1f} h")
+    if daily is not None:
+        parts.append(f"24·ΔEdf/Δtdf = {daily:.4f} kWh/d")
+    st.warning("  \n".join(parts))
 
 
 def _render_ss2(test: dict | None) -> None:
@@ -1358,6 +1489,7 @@ def _campaign_settings() -> dict:
                 "n_defrost_events": t.get("n_defrost_events") or 0,
                 "defrost_events": t.get("defrost_events") or [],
                 "power_gaps": t.get("power_gaps") or [],
+                "defrost_provisional": bool(t.get("defrost_provisional")),
                 "vs_target_warning": t.get("vs_target_warning"),
             }
             for t in st.session_state.get("tests") or []
@@ -1398,6 +1530,7 @@ def _apply_campaign_settings(data: dict) -> None:
             t["n_defrost_events"] = item.get("n_defrost_events") or 0
             t["defrost_events"] = item.get("defrost_events") or []
             t["power_gaps"] = item.get("power_gaps") or []
+            t["defrost_provisional"] = bool(item.get("defrost_provisional"))
             t["vs_target_warning"] = item.get("vs_target_warning")
             restored.append(t)
         st.session_state["tests"] = restored
@@ -2270,7 +2403,12 @@ def campaign_defrost_classification() -> en62552.DefrostClassification:
     return en62552.classify_defrost_controller(tcrt, elapsed)
 
 
-def _tdf_for_point(crt_ss_pct: float, delta_edf_wh: float, clf: en62552.DefrostClassification) -> float | None:
+def _tdf_for_point(
+    crt_ss_pct: float,
+    delta_edf_wh: float,
+    clf: en62552.DefrostClassification,
+    elapsed_hours: list[float] | None = None,
+) -> float | None:
     if not delta_edf_wh:
         return None
     if clf.kind == "elapsed_time" and clf.mean_elapsed_h:
@@ -2279,7 +2417,11 @@ def _tdf_for_point(crt_ss_pct: float, delta_edf_wh: float, clf: en62552.DefrostC
         try:
             return en62552.defrost_interval_crt(float(clf.mean_trt_h), crt_ss_pct)
         except ValueError:
-            return None
+            pass
+    if clf.mean_elapsed_h:
+        return round(float(clf.mean_elapsed_h), 1)
+    if elapsed_hours:
+        return round(float(elapsed_hours[0]), 1)
     return None
 
 
@@ -2295,7 +2437,12 @@ def collected_points() -> list[en62552.TestPoint]:
         point = en62552.TestPoint(**data)
         point = replace(
             point,
-            delta_tdf_h=_tdf_for_point(point.crt_ss_pct, point.delta_edf_wh, clf),
+            delta_tdf_h=_tdf_for_point(
+                point.crt_ss_pct,
+                point.delta_edf_wh,
+                clf,
+                elapsed_hours=test.get("elapsed_hours") or [],
+            ),
         )
         points.append(point)
     return points
@@ -2426,13 +2573,21 @@ def run_full_test(test: dict) -> None:
     tdh = 0.0
     tdr = 0.0
     local_clf = en62552.classify_defrost_controller(tcrt, elapsed)
-    tdf = _tdf_for_point(float(crt_ss), float(delta_e or 0), local_clf)
-    if tdf is None or not delta_e:
-        tdf_used = None
-        delta_e_used = 0.0
-    else:
+    tdf = _tdf_for_point(
+        float(crt_ss),
+        float(delta_e or 0),
+        local_clf,
+        elapsed_hours=elapsed,
+    )
+    n_int = len(tcrt)
+    if n_int >= 1 and delta_e:
         tdf_used = tdf
         delta_e_used = float(delta_e)
+        test["defrost_provisional"] = n_int < 2
+    else:
+        tdf_used = None
+        delta_e_used = 0.0
+        test["defrost_provisional"] = False
 
     vs_target = test.get("vs_target") or "onder"
     warning = en62552.check_vs_target_label(temps, targets_from_config(), vs_target)
@@ -2481,20 +2636,21 @@ settings_error = st.session_state.pop("settings_error", None)
 if settings_error:
     st.error(f"Instellingen laden mislukt: {settings_error}")
 
-tab_need, tab_appliance, tab_tests, tab_view, tab_analyse, tab_defrost, tab_combine, tab_log = st.tabs(
-    [
-        "Wat is nodig",
-        "Toestel",
-        "Meetpunten",
-        "Bekijk meting",
-        "Analyse één meting",
-        "Defrost",
-        "Interpolatie & jaarverbruik",
-        "Log",
-    ]
+st.session_state.setdefault("nav_tab", "need")
+pending_nav = st.session_state.pop("pending_nav_tab", None)
+if pending_nav:
+    st.session_state["nav_tab"] = pending_nav
+nav = st.segmented_control(
+    "Onderdeel",
+    options=[key for key, _ in NAV_TABS],
+    format_func=lambda key: NAV_LABELS[key],
+    key="nav_tab",
+    label_visibility="collapsed",
 )
+if not nav:
+    nav = "need"
 
-with tab_need:
+if nav == "need":
     st.subheader("Stappen volgens EN 62552-3")
     st.markdown(
         """
@@ -2532,7 +2688,7 @@ with tab_need:
         "(load processing) zitten nog niet in deze versie."
     )
 
-with tab_appliance:
+elif nav == "appliance":
     st.subheader("Compartimenten")
     st.caption(
         "Wijzig naam, type en volume, of voeg rijen toe. Type volgt Tabel 1 van de norm. "
@@ -2618,7 +2774,7 @@ with tab_appliance:
         except Exception as exc:
             st.error(str(exc))
 
-with tab_tests:
+elif nav == "tests":
     st.subheader("Meetpunten")
     st.caption(
         "Alle powermetingen staan in één map (bovenaan). Per meetpunt kies je alleen de "
@@ -2664,6 +2820,11 @@ with tab_tests:
                     edaily = float("nan")
                 success_lines = [
                     f"**SS1:** Pss={p['pss_w']:.3f} W, Edaily={edaily:.4f} kWh/d"
+                    + (
+                        " *(voorlopige defrost-energie)*"
+                        if test.get("defrost_provisional")
+                        else ""
+                    )
                 ]
                 temps_line = _temp_summary_line(p.get("mean_amb_c"), p.get("temps_c"))
                 if temps_line:
@@ -2696,20 +2857,21 @@ with tab_tests:
                         f"Ontdooi-events: {n_ev}, intervallen: {n_int}"
                         + (f", Δtrt uit meting ≈ {mean_trt:.2f} h" if mean_trt else "")
                     )
+                _render_provisional_defrost(test, p)
             cols = st.columns(2)
             if cols[0].button("Dit meetpunt analyseren", key=f"run_{i}"):
                 st.session_state["active_test"] = i
                 try:
                     with st.spinner(f"Analyse van {test['name']}…"):
                         run_full_test(test)
+                    st.session_state["analyse_error"] = None
                     st.session_state["flash"] = f"Meetpunt '{test['name']}' geanalyseerd."
-                    st.rerun()
                 except analysis.SS1NotFoundError as exc:
-                    st.error(str(exc))
-                    st.markdown("### Validatie stabiele periode (SS1)")
-                    _render_ss1_decision()
+                    st.session_state["analyse_error"] = str(exc)
                 except Exception as exc:
-                    st.error(str(exc))
+                    st.session_state["analyse_error"] = str(exc)
+                st.session_state["pending_nav_tab"] = "analyse"
+                st.rerun()
             if cols[1].button("Verwijderen", key=f"del_{i}"):
                 st.session_state["tests"].pop(i)
                 st.rerun()
@@ -2721,17 +2883,76 @@ with tab_tests:
         )
         st.rerun()
 
-with tab_view:
+elif nav == "view":
     st.subheader("Bekijk meting")
-    st.caption(
-        "Vermogen en temperaturen van de gekozen meting op de uitgelijnde tijdreeks "
-        "(dezelfde samples als na load_and_align_data). Niet alleen TCC-startpunten — "
-        "daardoor blijft T zichtbaar tot het einde van de overlap, ook na de laatste complete cyclus."
+    view_mode = st.radio(
+        "Bron",
+        options=["meetpunt", "doorlopend"],
+        format_func=lambda v: (
+            "Eén meetpunt (P + T uitgelijnd)"
+            if v == "meetpunt"
+            else "Doorlopende vermogensmeting (alle metingen)"
+        ),
+        horizontal=True,
+        key="view_mode",
+        help="Doorlopend: de hele wattmeterreeks, ook ontdooiingen tussen temperatuurmetingen.",
     )
     tests = st.session_state["tests"]
-    if not tests:
+    if view_mode == "doorlopend":
+        st.caption(
+            "Vermogen uit de hele power-map, chronologisch achter elkaar. "
+            "Gekleurde banden markeren de temperatuurmetingen. "
+            "Ontdooiingen tussen die metingen blijven zichtbaar in P "
+            f"(punten boven de drempel van {float(st.session_state.get('defrost_power_w', 50.0)):g} W)."
+        )
+        if not _campaign_power_pool():
+            st.info("Kies eerst de power-map in het tabblad Meetpunten.")
+        else:
+            try:
+                apply_appliance_config()
+            except Exception as exc:
+                st.warning(f"Toestelconfiguratie: {exc}")
+            for t in tests:
+                if t.get("temp_span") or not t.get("temp_file"):
+                    continue
+                try:
+                    _sync_power_selection(t)
+                except Exception:
+                    pass
+            try:
+                with st.spinner("Doorlopende powermeting laden…"):
+                    df_p = _continuous_power_df()
+            except Exception as exc:
+                st.error(str(exc))
+            else:
+                tmin = df_p[analysis.time_col].min()
+                tmax = df_p[analysis.time_col].max()
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Rijen (power)", f"{df_p.height:,}".replace(",", "."))
+                m2.metric("Start", str(tmin))
+                m3.metric("Einde", str(tmax))
+                fig_p = _plotly_continuous_power(
+                    df_p,
+                    tests,
+                    float(st.session_state.get("defrost_power_w", 50.0)),
+                )
+                st.plotly_chart(
+                    fig_p,
+                    width="stretch",
+                    config={
+                        "scrollZoom": True,
+                        "displaylogo": False,
+                        "modeBarButtonsToAdd": ["select2d", "lasso2d"],
+                    },
+                )
+    elif not tests:
         st.info("Voeg eerst een meetpunt toe in het tabblad Meetpunten.")
     else:
+        st.caption(
+            "Vermogen en temperaturen van de gekozen meting op de uitgelijnde tijdreeks "
+            "(dezelfde samples als na load_and_align_data). Niet alleen TCC-startpunten — "
+            "daardoor blijft T zichtbaar tot het einde van de overlap, ook na de laatste complete cyclus."
+        )
         idx_default = st.session_state.get("active_test", 0)
         if not (0 <= idx_default < len(tests)):
             idx_default = 0
@@ -2830,11 +3051,15 @@ with tab_view:
                     },
                 )
 
-with tab_analyse:
+elif nav == "analyse":
     st.subheader("Laatst geanalyseerde meting")
+    if st.session_state.get("analyse_error"):
+        st.error(st.session_state["analyse_error"])
     info = st.session_state["load_info"]
-    if info is None:
+    if info is None and not st.session_state.get("analyse_error"):
         st.info("Analyseer een meetpunt via het tabblad Meetpunten.")
+    elif info is None:
+        st.info("Geen uitgelijnde meting om te tonen. Controleer de fout hierboven.")
     else:
         m1, m2, m3 = st.columns(3)
         m1.metric("Rijen", f"{info['n_rows']:,}".replace(",", "."))
@@ -2877,6 +3102,7 @@ with tab_analyse:
                         )
                     if clf.warning:
                         st.warning(clf.warning)
+                _render_provisional_defrost(tests[idx])
 
             _render_ss2(tests[idx] if 0 <= idx < len(tests) else None)
 
@@ -2921,7 +3147,7 @@ with tab_analyse:
                 )
                 _show_fig(fig)
 
-with tab_defrost:
+elif nav == "defrost":
     st.subheader("Ontdooi-events")
     st.caption(
         "Overzicht van alle gedetecteerde defrosts na analyse van een meetpunt: "
@@ -2971,6 +3197,7 @@ with tab_defrost:
                 st.info("Nog geen analyse, of geen ontdooi-events in deze meting.")
                 continue
             any_events = True
+            _render_provisional_defrost(test)
             st.caption(
                 f"Type in deze meting: **{_KIND_NL.get(local_clf.kind, local_clf.kind)}**"
                 + (
@@ -3048,7 +3275,7 @@ with tab_defrost:
             width="stretch",
         )
 
-with tab_combine:
+elif nav == "combine":
     st.subheader("Interpolatie per omgeving en jaarverbruik")
     points = collected_points()
     targets = targets_from_config()
@@ -3071,6 +3298,12 @@ with tab_combine:
         )
     if clf.warning:
         st.warning(clf.warning)
+    if any(t.get("defrost_provisional") for t in st.session_state.get("tests") or []):
+        st.warning(
+            "Minstens één meetpunt gebruikt een **voorlopige** defrost-energie: "
+            "er is één interval gemeten en aangenomen dat het volgende gelijk is. "
+            "Edaily kan nog wijzigen als er meer ontdooiingen bij komen."
+        )
     if clf.kind == "elapsed_time":
         st.info(
             "Δtdf wordt voorlopig gelijk gesteld aan de gemeten kloktijd tussen ontdooiingen, "
@@ -3145,7 +3378,7 @@ with tab_combine:
             ax.set_title("Dagelijks energieverbruik bij de twee testomgevingen")
             _show_fig(fig)
 
-with tab_log:
+elif nav == "log":
     if st.session_state["log"]:
         st.code(st.session_state["log"], language=None)
     else:

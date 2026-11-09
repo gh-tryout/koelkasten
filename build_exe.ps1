@@ -6,15 +6,6 @@ python -m PyInstaller --noconfirm --clean koelkastanalyse.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller mislukte." }
 
 $dist = Join-Path $PSScriptRoot "dist\Koelkastanalyse"
-foreach ($folder in @("power_meetdata_map", "temp_meetdata_map")) {
-    $src = Join-Path $PSScriptRoot $folder
-    $dst = Join-Path $dist $folder
-    if (Test-Path $src) {
-        if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
-        Copy-Item $src $dst -Recurse
-    }
-}
-
 $doc = Join-Path $PSScriptRoot "documentatie_koelkastanalyse.html"
 if (Test-Path $doc) {
     Copy-Item $doc (Join-Path $dist "documentatie_koelkastanalyse.html") -Force
@@ -29,8 +20,8 @@ Er opent een zwart venster en daarna de browser (http://127.0.0.1:...).
 Sluit het zwarte venster om te stoppen.
 
 Deze map moet bij elkaar blijven (vooral de map _internal).
-Voorbeeldmetingen staan in power_meetdata_map en temp_meetdata_map.
-Eigen CSV's kun je in de GUI invoeren (pad naar de bestanden).
+Meetdata zit niet in deze map: kies in de GUI de power-map en per
+meetpunt de temperatuurmap op de pc.
 
 Windows Defender kan de exe de eerste keer blokkeren omdat die niet
 digitaal ondertekend is. Kies dan 'Toch uitvoeren'.

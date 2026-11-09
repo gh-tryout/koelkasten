@@ -20,6 +20,9 @@ hiddenimports = [
     "streamlit.web.cli",
     "streamlit.web.bootstrap",
     "matplotlib.backends.backend_agg",
+    "plotly",
+    "plotly.graph_objects",
+    "plotly.subplots",
 ]
 
 for pkg in (
@@ -30,6 +33,7 @@ for pkg in (
     "matplotlib",
     "numpy",
     "PIL",
+    "plotly",
 ):
     d, b, h = collect_all(pkg)
     datas += d
@@ -55,6 +59,7 @@ for pkg in (
     "pillow",
     "gitpython",
     "watchdog",
+    "plotly",
     "cachetools",
     "typing_extensions",
     "rich",
