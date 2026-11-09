@@ -29,7 +29,6 @@ for pkg in (
     "streamlit",
     "altair",
     "polars",
-    "pandas",
     "matplotlib",
     "numpy",
     "PIL",
@@ -91,7 +90,17 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["pytest", "IPython", "jupyter", "notebook"],
+    excludes=[
+        "pytest",
+        "IPython",
+        "jupyter",
+        "notebook",
+        "pandas.tests",
+        "numpy.tests",
+        "matplotlib.tests",
+        "polars.tests",
+        "plotly.matplotlylib",
+    ],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
