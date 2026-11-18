@@ -2,7 +2,25 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-python -m PyInstaller --noconfirm --clean koelkastanalyse.spec
+# --clean en COLLECT-rmtree geven op OneDrive vaak WinError 5.
+# Verwijder dist/build eerst; hernoem als een bestand nog openstaat.
+function Remove-BuildDir([string]$name) {
+    $path = Join-Path $PSScriptRoot $name
+    if (-not (Test-Path $path)) { return }
+    try {
+        Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+    } catch {
+        $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        $backup = Join-Path $PSScriptRoot ("{0}.old-{1}" -f $name, $stamp)
+        Rename-Item -LiteralPath $path -NewName (Split-Path $backup -Leaf)
+        Write-Host "Kon $name niet verwijderen; hernoemd naar $(Split-Path $backup -Leaf)"
+    }
+}
+
+Remove-BuildDir "dist"
+Remove-BuildDir "build"
+
+python -m PyInstaller --noconfirm koelkastanalyse.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller mislukte." }
 
 $dist = Join-Path $PSScriptRoot "dist\Koelkastanalyse"
