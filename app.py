@@ -82,7 +82,7 @@ NAV_TABS = [
 ]
 NAV_LABELS = dict(NAV_TABS)
 _TESTPOINT_FIELDS = {f.name for f in fields(en62552.TestPoint)}
-_SETTINGS_VERSION = 2
+_SETTINGS_VERSION = 3
 
 
 def _blank_test(
@@ -99,6 +99,7 @@ def _blank_test(
         "power_glob": "",
         "temp_file": "",
         "temp_folder": "",
+        "temp_file_name": "",
         "point": None,
         "tcrt_hours": [],
         "elapsed_hours": [],
@@ -190,6 +191,7 @@ def _migrate_tests(tests: list[dict]) -> None:
         t.setdefault("power_gaps", [])
         t.setdefault("defrost_provisional", False)
         t.setdefault("temp_folder", "")
+        t.setdefault("temp_file_name", Path(_norm_path(t.get("temp_file"))).name)
         t.setdefault("vs_target_warning", None)
         t.setdefault("ss2", None)
         t.setdefault("analysis", None)
@@ -251,7 +253,35 @@ def _init_state() -> None:
         st.session_state.setdefault(key, None)
     st.session_state.setdefault("power_folder", "")
     st.session_state.setdefault("power_pool", [])
+    st.session_state.setdefault("settings_path", "")
+    st.session_state.setdefault("settings_base_dir", "")
+    pending_power = st.session_state.pop("pending_power_folder", None)
+    if pending_power is not None:
+        _apply_campaign_power(pending_power)
+        st.session_state["power_folder_text"] = st.session_state.get("power_folder") or ""
+    pending_temp_folder = st.session_state.pop("pending_temp_folder", None)
+    if pending_temp_folder is not None:
+        index, folder = pending_temp_folder
+        tests = st.session_state.get("tests") or []
+        if 0 <= index < len(tests):
+            _apply_temp_folder(tests[index], folder, index=index, sync_widgets=True)
+    pending_temp_file = st.session_state.pop("pending_temp_file", None)
+    if pending_temp_file is not None:
+        index, path = pending_temp_file
+        tests = st.session_state.get("tests") or []
+        if 0 <= index < len(tests):
+            tests[index]["temp_file"] = path
+            tests[index]["temp_file_name"] = Path(path).name
+            tests[index]["temp_folder"] = str(Path(path).parent)
+            st.session_state[f"tf_{index}"] = tests[index]["temp_folder"]
+            st.session_state[f"t_{index}"] = path
+            _sync_power_selection(tests[index])
+    if st.session_state.pop("pending_reload_folders", None):
+        notes = _reload_configured_folders()
+        st.session_state["flash"] = "Mappen opnieuw ingelezen. " + " | ".join(notes[:2])
     _ensure_campaign_power()
+    if "power_folder_text" not in st.session_state:
+        st.session_state["power_folder_text"] = st.session_state.get("power_folder") or ""
 
 
 ANALYSIS_SNAPSHOT_KEYS = (
@@ -1228,11 +1258,47 @@ Periodeselectie op compartiment(en): **{', '.join(sel) if sel else '—'}**.
         st.dataframe(pdf, hide_index=True, width="stretch")
 
 
+def _norm_path(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip().strip('"').strip("'")
+    if not text or text.lower() in {"none", "nan"}:
+        return ""
+    return text
+
+
+def _path_bases() -> list[Path]:
+    bases: list[Path] = []
+    loaded = _norm_path(st.session_state.get("settings_base_dir"))
+    if loaded:
+        bases.append(Path(loaded))
+    bases.append(PROJECT_DIR)
+    return bases
+
+
+def _resolve_configured_path(path: str, *, must_exist: bool = False) -> str:
+    raw = _norm_path(path)
+    if not raw:
+        return ""
+    candidates = [Path(raw).expanduser()]
+    original = candidates[0]
+    if not original.is_absolute():
+        for base in _path_bases():
+            candidates.append(base / original)
+        candidates.append(PROJECT_DIR / original)
+    for cand in candidates:
+        try:
+            if cand.exists():
+                return str(cand)
+        except Exception:
+            continue
+    if must_exist:
+        return ""
+    return str(original)
+
+
 def _resolve_temp_path(temp_file: str) -> str:
-    path = Path(temp_file)
-    if not path.is_absolute():
-        path = PROJECT_DIR / path
-    return str(path)
+    return _resolve_configured_path(temp_file) or _norm_path(temp_file)
 
 
 UPLOAD_ROOT = PROJECT_DIR / "_uploads"
@@ -1393,18 +1459,17 @@ def _default_power_folder() -> str:
 
 
 def _ensure_campaign_power() -> None:
+    folder = _norm_path(st.session_state.get("power_folder"))
+    if folder:
+        resolved = _resolve_configured_path(folder)
+        st.session_state["power_folder"] = resolved or folder
+        st.session_state["power_pool"] = _list_power_files(resolved or folder)
+        return
     pool = [p for p in (st.session_state.get("power_pool") or []) if Path(p).is_file()]
-    folder = st.session_state.get("power_folder") or ""
     if pool:
         st.session_state["power_pool"] = pool
-        if not folder:
-            st.session_state["power_folder"] = str(Path(pool[0]).parent)
+        st.session_state["power_folder"] = str(Path(pool[0]).parent)
         return
-    if folder:
-        files = _list_power_files(folder)
-        if files:
-            st.session_state["power_pool"] = files
-            return
     for t in st.session_state.get("tests") or []:
         legacy = t.get("power_pool") or t.get("power_paths")
         if legacy:
@@ -1482,21 +1547,28 @@ def _sync_power_selection(test: dict) -> None:
 
 
 def _apply_campaign_power(paths: list[str] | str) -> None:
-    files = _list_power_files(paths)
-    st.session_state["power_pool"] = files
-    if isinstance(paths, str) and Path(paths).is_dir():
-        st.session_state["power_folder"] = paths
-    elif files:
-        st.session_state["power_folder"] = str(Path(files[0]).parent)
-    elif isinstance(paths, str):
-        st.session_state["power_folder"] = paths
+    if isinstance(paths, str):
+        configured = _resolve_configured_path(paths) or _norm_path(paths)
+        files = _list_power_files(configured) if configured else []
+        st.session_state["power_pool"] = files
+        if configured:
+            st.session_state["power_folder"] = configured
+        elif files:
+            st.session_state["power_folder"] = str(Path(files[0]).parent)
+        else:
+            st.session_state["power_folder"] = ""
+    else:
+        files = _list_power_files(paths)
+        st.session_state["power_pool"] = files
+        if files:
+            st.session_state["power_folder"] = str(Path(files[0]).parent)
+        elif not st.session_state.get("power_folder"):
+            st.session_state["power_folder"] = ""
     glob = (
         str(Path(st.session_state["power_folder"]) / "*")
         if st.session_state.get("power_folder")
         else ""
     )
-    if "power_folder_text" in st.session_state:
-        st.session_state["power_folder_text"] = st.session_state.get("power_folder") or ""
     for t in st.session_state.get("tests") or []:
         t["power_pool"] = files
         t["power_paths"] = files
@@ -1505,31 +1577,115 @@ def _apply_campaign_power(paths: list[str] | str) -> None:
         _sync_power_selection(t)
 
 
-def _apply_temp_folder(test: dict, folder: str, index: int | None = None) -> None:
-    test["temp_folder"] = folder or ""
-    files = _list_power_files(folder) if folder else []
+def _preferred_temp_name(test: dict, preferred_file: str | None = None) -> str:
+    for value in (
+        preferred_file,
+        test.get("temp_file_name"),
+        test.get("temp_file"),
+    ):
+        name = Path(_norm_path(value)).name if _norm_path(value) else ""
+        if name:
+            return name
+    return ""
+
+
+def _apply_temp_folder(
+    test: dict,
+    folder: str,
+    index: int | None = None,
+    preferred_file: str | None = None,
+    sync_widgets: bool = False,
+) -> None:
+    configured = _resolve_configured_path(folder) or _norm_path(folder)
+    test["temp_folder"] = configured
+    files = _list_power_files(configured) if configured else []
     test["temp_candidates"] = files
-    if len(files) == 1:
+    wanted = _preferred_temp_name(test, preferred_file)
+    match = next((p for p in files if Path(p).name.lower() == wanted.lower()), None) if wanted else None
+    if match:
+        test["temp_file"] = match
+    elif len(files) == 1:
         test["temp_file"] = files[0]
     elif test.get("temp_file") and files and test["temp_file"] not in files:
-        resolved = _resolve_temp_path(test["temp_file"])
-        match = next((p for p in files if Path(p).name == Path(resolved).name), None)
-        test["temp_file"] = match or ""
+        test["temp_file"] = ""
     elif not files:
-        if not (test.get("temp_file") and Path(_resolve_temp_path(test["temp_file"])).is_file()):
+        kept = _resolve_temp_path(test.get("temp_file") or "")
+        if not (kept and Path(kept).is_file()):
             test["temp_file"] = ""
-    if index is not None:
-        if f"tf_{index}" in st.session_state:
-            st.session_state[f"tf_{index}"] = folder
-        if f"t_{index}" in st.session_state:
-            st.session_state[f"t_{index}"] = test.get("temp_file") or ""
+    if test.get("temp_file"):
+        test["temp_file_name"] = Path(test["temp_file"]).name
+    elif wanted:
+        test["temp_file_name"] = wanted
+    if sync_widgets and index is not None:
+        st.session_state[f"tf_{index}"] = configured
+        st.session_state[f"t_{index}"] = test.get("temp_file") or ""
     _sync_power_selection(test)
 
 
+def _sync_folder_widgets_into_state() -> None:
+    text = st.session_state.get("power_folder_text")
+    if text is not None:
+        st.session_state["power_folder"] = _norm_path(text)
+    for i, test in enumerate(st.session_state.get("tests") or []):
+        tf = st.session_state.get(f"tf_{i}")
+        if tf is not None:
+            test["temp_folder"] = _norm_path(tf)
+        tfile = st.session_state.get(f"t_{i}")
+        if tfile is not None:
+            test["temp_file"] = _norm_path(tfile)
+        if test.get("temp_file") and not test.get("temp_folder"):
+            parent = Path(test["temp_file"]).parent
+            if str(parent) not in {"", "."}:
+                test["temp_folder"] = str(parent)
+
+
+def _reload_configured_folders() -> list[str]:
+    _sync_folder_widgets_into_state()
+    notes: list[str] = []
+    folder = _norm_path(st.session_state.get("power_folder"))
+    _apply_campaign_power(folder)
+    resolved_power = _norm_path(st.session_state.get("power_folder"))
+    n_power = len(st.session_state.get("power_pool") or [])
+    if resolved_power:
+        if Path(resolved_power).is_dir():
+            notes.append(f"Power-map: {resolved_power} ({n_power} bestand(en))")
+        else:
+            notes.append(f"Power-map bestaat nog niet: {resolved_power}")
+    else:
+        notes.append("Geen power-map in de JSON.")
+    for i, test in enumerate(st.session_state.get("tests") or []):
+        preferred = test.get("temp_file") or test.get("temp_file_name") or ""
+        _apply_temp_folder(
+            test,
+            test.get("temp_folder") or "",
+            index=i,
+            preferred_file=preferred,
+            sync_widgets=True,
+        )
+        label = test.get("name") or f"Meting {i + 1}"
+        folder = _norm_path(test.get("temp_folder"))
+        temp = _norm_path(test.get("temp_file"))
+        if folder and not Path(folder).is_dir():
+            notes.append(f"{label}: map bestaat nog niet — {folder}")
+        elif temp and Path(_resolve_temp_path(temp)).is_file():
+            notes.append(f"{label}: {Path(temp).name} in {folder or Path(temp).parent}")
+        elif folder:
+            notes.append(f"{label}: map gevonden, nog geen temperatuurbestand — {folder}")
+        else:
+            notes.append(f"{label}: geen temperatuurmap in de JSON.")
+    st.session_state["power_folder_text"] = resolved_power
+    st.session_state["folder_status"] = notes
+    return notes
+
+
 def _campaign_settings() -> dict:
+    _sync_folder_widgets_into_state()
+    power_folder = _norm_path(st.session_state.get("power_folder"))
     return {
         "version": _SETTINGS_VERSION,
-        "power_folder": st.session_state.get("power_folder") or "",
+        "power_folder": power_folder,
+        "power_glob": str(Path(power_folder) / "*") if power_folder else "",
+        "settings_path": _norm_path(st.session_state.get("settings_path")),
         "compartments": _compartment_records(_as_comp_df(st.session_state["compartments_df"])),
         "ambient_sensors": st.session_state.get("ambient_sensors"),
         "gradient_sensors": st.session_state.get("gradient_sensors"),
@@ -1542,8 +1698,12 @@ def _campaign_settings() -> dict:
                 "name": t.get("name"),
                 "ambient_c": t.get("ambient_c"),
                 "vs_target": t.get("vs_target"),
-                "temp_folder": t.get("temp_folder") or "",
-                "temp_file": t.get("temp_file") or "",
+                "temp_folder": _norm_path(t.get("temp_folder")),
+                "temp_file": _norm_path(t.get("temp_file")),
+                "temp_file_name": Path(_norm_path(t.get("temp_file"))).name
+                or _norm_path(t.get("temp_file_name")),
+                "power_glob": _norm_path(t.get("power_glob"))
+                or (str(Path(power_folder) / "*") if power_folder else ""),
                 "point": t.get("point"),
                 "tcrt_hours": t.get("tcrt_hours") or [],
                 "elapsed_hours": t.get("elapsed_hours") or [],
@@ -1561,6 +1721,10 @@ def _campaign_settings() -> dict:
 def _apply_campaign_settings(data: dict) -> None:
     if not isinstance(data, dict):
         raise ValueError("Ongeldig instellingenbestand.")
+    loaded_from = _norm_path(data.get("_loaded_from") or data.get("settings_path"))
+    if loaded_from:
+        st.session_state["settings_path"] = loaded_from
+        st.session_state["settings_base_dir"] = str(Path(loaded_from).parent)
     comps = data.get("compartments")
     if comps is not None:
         st.session_state["compartments_df"] = _as_comp_df(comps)
@@ -1574,7 +1738,6 @@ def _apply_campaign_settings(data: dict) -> None:
         st.session_state["interp_delta_t_k"] = float(data["interp_delta_t_k"])
     if "heater_advances_timer" in data:
         st.session_state["heater_advances_timer"] = bool(data["heater_advances_timer"])
-    folder = data.get("power_folder") or ""
     tests_in = data.get("tests")
     if tests_in:
         restored = []
@@ -1585,8 +1748,12 @@ def _apply_campaign_settings(data: dict) -> None:
                 item.get("vs_target") or "onder",
                 test_id=item.get("id"),
             )
-            t["temp_folder"] = item.get("temp_folder") or ""
-            t["temp_file"] = item.get("temp_file") or ""
+            t["temp_folder"] = _norm_path(item.get("temp_folder"))
+            t["temp_file"] = _norm_path(item.get("temp_file"))
+            t["temp_file_name"] = _norm_path(item.get("temp_file_name")) or (
+                Path(t["temp_file"]).name if t["temp_file"] else ""
+            )
+            t["power_glob"] = _norm_path(item.get("power_glob"))
             t["point"] = item.get("point")
             t["tcrt_hours"] = item.get("tcrt_hours") or []
             t["elapsed_hours"] = item.get("elapsed_hours") or []
@@ -1598,27 +1765,23 @@ def _apply_campaign_settings(data: dict) -> None:
             restored.append(t)
         st.session_state["tests"] = restored
         _migrate_tests(st.session_state["tests"])
-    if folder:
-        _apply_campaign_power(folder)
-    else:
-        for t in st.session_state.get("tests") or []:
-            if t.get("temp_folder"):
-                _apply_temp_folder(t, t["temp_folder"])
-            elif t.get("temp_file"):
-                _sync_power_selection(t)
+    power_folder = _norm_path(data.get("power_folder"))
+    if not power_folder:
+        power_glob = _norm_path(data.get("power_glob"))
+        if power_glob:
+            parent = Path(power_glob.replace("\\", "/")).parent
+            if str(parent) not in {"", "."}:
+                power_folder = str(Path(power_glob).parent)
+    st.session_state["power_folder"] = power_folder
+    st.session_state["power_folder_text"] = power_folder
     if tests_in:
         for i, t in enumerate(st.session_state.get("tests") or []):
-            if t.get("temp_folder"):
-                _apply_temp_folder(t, t["temp_folder"])
-            elif t.get("temp_file"):
-                _sync_power_selection(t)
             st.session_state[f"n_{i}"] = t.get("name") or ""
             st.session_state[f"a_{i}"] = int(t.get("ambient_c") or 32)
             st.session_state[f"vs_{i}"] = t.get("vs_target") or "onder"
             st.session_state[f"tf_{i}"] = t.get("temp_folder") or ""
             st.session_state[f"t_{i}"] = t.get("temp_file") or ""
-    if folder:
-        st.session_state["power_folder_text"] = folder
+    _reload_configured_folders()
 
 
 def _render_campaign_power() -> None:
@@ -1665,34 +1828,37 @@ def _render_campaign_power() -> None:
         if st.button("Power-map kiezen…", key="pick_campaign_power"):
             folder = _pick_local_directory("Map met alle power-bestanden")
             if folder:
-                files = _list_power_files(folder)
-                if files:
-                    _apply_campaign_power(folder)
-                    st.rerun()
-                else:
-                    st.warning("In die map staan geen CSV/TXT/DAT-bestanden.")
+                st.session_state["pending_power_folder"] = folder
+                st.rerun()
 
     folder_key = "power_folder_text"
     if folder_key not in st.session_state:
         st.session_state[folder_key] = st.session_state.get("power_folder") or ""
     new_folder = st.text_input("Pad van de power-map", key=folder_key)
     if new_folder != (st.session_state.get("power_folder") or ""):
-        if not new_folder or Path(new_folder).is_dir():
-            _apply_campaign_power(new_folder)
+        _apply_campaign_power(new_folder)
 
     pool = _campaign_power_pool()
     folder = st.session_state.get("power_folder") or ""
-    if pool:
+    if folder and not Path(folder).is_dir():
+        st.warning(f"Power-map bestaat nog niet: {folder}. Zet de CSV’s in deze map.")
+    elif pool:
         st.caption(f"{len(pool)} power-bestand(en) in {folder or Path(pool[0]).parent}")
     else:
-        st.caption("Nog geen power-map gekozen.")
+        st.caption("Nog geen power-map gekozen, of de map is leeg.")
+    if st.button("Mappen opnieuw inlezen", key="reload_folders"):
+        st.session_state["pending_reload_folders"] = True
+        st.rerun()
+    for line in st.session_state.get("folder_status") or []:
+        st.caption(line)
 
 
 def _render_settings_io() -> None:
     st.markdown("**Instellingen opslaan en openen**")
     st.caption(
-        "Bestandslocaties, gekozen temperatuurbestanden en compartimentgegevens. "
-        "Lokaal: opslaan/openen op schijf. Overal: downloaden of uploaden als JSON."
+        "De JSON bevat compartimenten, sensoren én de lokale mappen (power-map en "
+        "temperatuurmap per meetpunt). Voor een volgende koelkast met dezelfde "
+        "compartimenten: zet nieuwe bestanden in diezelfde mappen en laad alleen deze JSON."
     )
     local = _is_local_client()
     payload = json.dumps(_campaign_settings(), indent=2, default=str)
@@ -1701,13 +1867,20 @@ def _render_settings_io() -> None:
         if cols[0].button("Opslaan op deze pc…", key="save_settings_local"):
             path = _pick_local_saveas("Campagne-instellingen opslaan")
             if path:
-                Path(path).write_text(payload, encoding="utf-8")
+                data = _campaign_settings()
+                data["settings_path"] = path
+                Path(path).write_text(
+                    json.dumps(data, indent=2, default=str), encoding="utf-8"
+                )
+                st.session_state["settings_path"] = path
+                st.session_state["settings_base_dir"] = str(Path(path).parent)
                 st.session_state["flash"] = f"Instellingen opgeslagen: {path}"
                 st.rerun()
         if cols[1].button("Openen van deze pc…", key="open_settings_local"):
             chosen = _pick_local_files(multiple=False, title="Campagne-instellingen (JSON)")
             if chosen:
                 data = json.loads(Path(chosen[0]).read_text(encoding="utf-8"))
+                data["_loaded_from"] = chosen[0]
                 st.session_state["pending_settings"] = data
                 st.session_state["flash"] = f"Instellingen geladen: {chosen[0]}"
                 st.rerun()
@@ -1784,20 +1957,14 @@ def _render_temp_files(test: dict, index: int) -> None:
         if c1.button("Temperatuurmap kiezen…", key=f"pick_td_{index}"):
             folder = _pick_local_directory("Map met temperatuurmeting")
             if folder:
-                files = _list_power_files(folder)
-                if files:
-                    _apply_temp_folder(test, folder, index)
-                    test.pop("_temp_upload_sig", None)
-                    st.rerun()
-                else:
-                    st.warning("In die map staan geen CSV/TXT/DAT-bestanden.")
+                test.pop("_temp_upload_sig", None)
+                st.session_state["pending_temp_folder"] = (index, folder)
+                st.rerun()
         if c2.button("Temperatuur-CSV kiezen…", key=f"pick_t_{index}"):
             chosen = _pick_local_files(multiple=False, title="Temperatuur-CSV")
             if chosen:
-                test["temp_file"] = chosen[0]
-                test["temp_folder"] = str(Path(chosen[0]).parent)
                 test.pop("_temp_upload_sig", None)
-                _sync_power_selection(test)
+                st.session_state["pending_temp_file"] = (index, chosen[0])
                 st.rerun()
 
     tf_key, t_key = f"tf_{index}", f"t_{index}"
@@ -1807,10 +1974,11 @@ def _render_temp_files(test: dict, index: int) -> None:
         st.session_state[t_key] = test.get("temp_file") or ""
     new_folder = st.text_input("Pad van de temperatuurmap", key=tf_key)
     if new_folder != (test.get("temp_folder") or ""):
-        if not new_folder or Path(new_folder).is_dir():
-            _apply_temp_folder(test, new_folder, index)
+        _apply_temp_folder(test, new_folder, index)
     else:
         test["temp_folder"] = new_folder
+    if new_folder and not Path(new_folder).is_dir():
+        st.warning(f"Temperatuurmap bestaat nog niet: {new_folder}")
 
     candidates = test.get("temp_candidates")
     if candidates is None and test.get("temp_folder"):
