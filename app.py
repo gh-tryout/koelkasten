@@ -46,12 +46,14 @@ DEFAULT_COMPARTMENTS = [
     {
         "name": "fridge",
         "table_type": "Fresh food",
+        "target_c": 4.0,
         "volume": 233.0,
         "sensors": "105 (C), 202 (C), 209 (C)",
     },
     {
         "name": "freezer 3 star",
         "table_type": "Three-star",
+        "target_c": -18.0,
         "volume": 107.0,
         "sensors": "102 (C), 103 (C), 201 (C), 203 (C), 107 (C)",
     },
@@ -118,6 +120,11 @@ def _default_tests() -> list[dict]:
     ]
 
 
+def _default_target_c(table_type) -> float:
+    key = str(table_type) if table_type and not pd.isna(table_type) else "Fresh food"
+    return float(en62552.COMPARTMENT_TARGETS_C.get(key, 4.0))
+
+
 def _as_comp_df(value) -> pd.DataFrame:
     df = value if isinstance(value, pd.DataFrame) else pd.DataFrame(value)
     for col, default in (
@@ -128,7 +135,17 @@ def _as_comp_df(value) -> pd.DataFrame:
     ):
         if col not in df.columns:
             df[col] = default
-    return df[["name", "table_type", "volume", "sensors"]].copy()
+    if "target_c" not in df.columns:
+        df["target_c"] = [_default_target_c(t) for t in df["table_type"]]
+    else:
+        filled = []
+        for ttype, val in zip(df["table_type"], df["target_c"]):
+            if val is None or (isinstance(val, float) and pd.isna(val)) or val == "":
+                filled.append(_default_target_c(ttype))
+            else:
+                filled.append(float(val))
+        df["target_c"] = filled
+    return df[["name", "table_type", "target_c", "volume", "sensors"]].copy()
 
 
 def _compartment_records(df: pd.DataFrame) -> list[dict]:
@@ -142,6 +159,11 @@ def _compartment_records(df: pd.DataFrame) -> list[dict]:
         volume = row.get("volume")
         volume = 0.0 if pd.isna(volume) else float(volume)
         sensors = "" if pd.isna(row.get("sensors")) else str(row.get("sensors")).strip()
+        target_c = row.get("target_c")
+        if target_c is None or pd.isna(target_c):
+            target_c = _default_target_c(table_type)
+        else:
+            target_c = float(target_c)
         if not name and not sensors:
             continue
         records.append(
@@ -150,6 +172,7 @@ def _compartment_records(df: pd.DataFrame) -> list[dict]:
                 "table_type": table_type
                 if table_type in en62552.COMPARTMENT_TARGETS_C
                 else "Fresh food",
+                "target_c": target_c,
                 "volume": volume,
                 "sensors": sensors,
             }
@@ -169,6 +192,7 @@ def _migrate_tests(tests: list[dict]) -> None:
         t.setdefault("temp_folder", "")
         t.setdefault("vs_target_warning", None)
         t.setdefault("ss2", None)
+        t.setdefault("analysis", None)
         t.pop("setpoint", None)
 
 
@@ -193,6 +217,7 @@ def _init_state() -> None:
     st.session_state.setdefault("gradient_sensors", "110 (C), 206 (C)")
     st.session_state.setdefault("heater_advances_timer", False)
     st.session_state.setdefault("defrost_power_w", 50.0)
+    st.session_state.setdefault("interp_delta_t_k", 4.0)
     st.session_state.setdefault("tests", _default_tests())
     _migrate_tests(st.session_state["tests"])
     st.session_state.setdefault("active_test", 0)
@@ -229,27 +254,62 @@ def _init_state() -> None:
     _ensure_campaign_power()
 
 
+ANALYSIS_SNAPSHOT_KEYS = (
+    "lf_meas_data",
+    "load_info",
+    "df_TCC",
+    "df_TCC_w_streaks_and_means",
+    "df_meas_data_w_smooth_w_TCC_id",
+    "plot_data",
+    "ss1_opti",
+    "pss",
+    "df_all_possible_periods_w_stats",
+    "mean_amb_temp",
+    "Delta_E_dfj_wh",
+    "delta_t_df",
+    "ss1_candidates",
+    "ss2",
+    "df1_details",
+    "ss1_diagnostics",
+    "ss1_diag_summary",
+)
+
+
+def _interp_delta_t_k() -> float:
+    try:
+        value = float(st.session_state.get("interp_delta_t_k", 4.0))
+    except (TypeError, ValueError):
+        value = 4.0
+    return value if value > 0 else 4.0
+
+
 def _clear_analysis() -> None:
-    for key in (
-        "lf_meas_data",
-        "load_info",
-        "df_TCC",
-        "df_TCC_w_streaks_and_means",
-        "df_meas_data_w_smooth_w_TCC_id",
-        "plot_data",
-        "ss1_opti",
-        "pss",
-        "df_all_possible_periods_w_stats",
-        "mean_amb_temp",
-        "Delta_E_dfj_wh",
-        "delta_t_df",
-        "ss1_candidates",
-        "ss2",
-        "df1_details",
-        "ss1_diagnostics",
-        "ss1_diag_summary",
-    ):
+    for key in ANALYSIS_SNAPSHOT_KEYS:
         st.session_state[key] = None
+
+
+def _snapshot_analysis(test: dict) -> None:
+    test["analysis"] = {key: st.session_state.get(key) for key in ANALYSIS_SNAPSHOT_KEYS}
+    test["analysis"]["log"] = st.session_state.get("log")
+    test["analysis"]["analyse_error"] = st.session_state.get("analyse_error")
+
+
+def _restore_analysis(test: dict) -> bool:
+    snap = test.get("analysis")
+    if not snap:
+        return False
+    for key in ANALYSIS_SNAPSHOT_KEYS:
+        st.session_state[key] = snap.get(key)
+    if snap.get("log") is not None:
+        st.session_state["log"] = snap.get("log")
+    st.session_state["analyse_error"] = snap.get("analyse_error")
+    st.session_state["ss2"] = test.get("ss2") or snap.get("ss2")
+    return True
+
+
+def _has_analysis(test: dict) -> bool:
+    snap = test.get("analysis") or {}
+    return bool(snap.get("load_info") or snap.get("pss") or snap.get("ss1_diagnostics"))
 
 
 def _run_with_log(fn):
@@ -1474,6 +1534,7 @@ def _campaign_settings() -> dict:
         "ambient_sensors": st.session_state.get("ambient_sensors"),
         "gradient_sensors": st.session_state.get("gradient_sensors"),
         "defrost_power_w": st.session_state.get("defrost_power_w"),
+        "interp_delta_t_k": _interp_delta_t_k(),
         "heater_advances_timer": st.session_state.get("heater_advances_timer"),
         "tests": [
             {
@@ -1509,6 +1570,8 @@ def _apply_campaign_settings(data: dict) -> None:
             st.session_state[key] = data[key]
     if data.get("defrost_power_w") is not None:
         st.session_state["defrost_power_w"] = float(data["defrost_power_w"])
+    if data.get("interp_delta_t_k") is not None:
+        st.session_state["interp_delta_t_k"] = float(data["interp_delta_t_k"])
     if "heater_advances_timer" in data:
         st.session_state["heater_advances_timer"] = bool(data["heater_advances_timer"])
     folder = data.get("power_folder") or ""
@@ -1831,7 +1894,7 @@ def apply_appliance_config() -> dict:
             "temp sensors": sensors,
             "volume": float(row["volume"]),
             "compartment type": en62552.frozen_unfrozen(table_type),
-            "target_temp": en62552.COMPARTMENT_TARGETS_C[table_type],
+            "target_temp": float(row.get("target_c", _default_target_c(table_type))),
             "table_type": table_type,
         }
     amb = [s.strip() for s in st.session_state["ambient_sensors"].split(",") if s.strip()]
@@ -1848,7 +1911,7 @@ def apply_appliance_config() -> dict:
 
 def targets_from_config() -> dict[str, float]:
     return {
-        row["name"]: en62552.COMPARTMENT_TARGETS_C[row["table_type"]]
+        row["name"]: float(row.get("target_c", _default_target_c(row["table_type"])))
         for row in _compartment_records(_as_comp_df(st.session_state["compartments_df"]))
         if row["table_type"] in en62552.COMPARTMENT_TARGETS_C
     }
@@ -2658,7 +2721,7 @@ if nav == "need":
 2. **Twee omgevingen meten** — 16 °C én 32 °C (geen ijsbereiding, geen load-processing).
 3. **Per omgeving twee instellingen** — de thermostaat is vaak een draaiknop zonder schaal.
    Kies alleen of de knop **kouder** of **warmer** staat dan de doeltemperatuur.
-   De energie bij target volgt altijd uit **interpolatie** tussen die twee metingen (Annex E.3; geen extrapolatie, ΔT ≤ 4 K).
+   De energie bij target volgt altijd uit **interpolatie** tussen die twee metingen (Annex E.3; geen extrapolatie, ΔT instelbaar, standaard 4 K).
 4. **Per meting de energiecomponenten bepalen**:
    - steady-state vermogen **Pss** (Annex B / SS1)
    - extra ontdooi-energie **ΔEdf** (Annex C)
@@ -2677,7 +2740,9 @@ if nav == "need":
         st.error(f"{exc} — {getattr(analysis, '__file__', analysis)}")
     points = collected_points()
     targets = targets_from_config()
-    for item in en62552.campaign_status(points, targets):
+    for item in en62552.campaign_status(
+        points, targets, max_delta_t_k=_interp_delta_t_k()
+    ):
         if item["ok"]:
             st.success(item["text"])
         else:
@@ -2702,6 +2767,7 @@ elif nav == "appliance":
                 {
                     "name": f"compartiment {len(df) + 1}",
                     "table_type": "Fresh food",
+                    "target_c": 4.0,
                     "volume": 0.0,
                     "sensors": "",
                 }
@@ -2717,8 +2783,10 @@ elif nav == "appliance":
         else:
             st.warning("Er moet minstens één compartiment blijven.")
 
+    current_df = _as_comp_df(st.session_state["compartments_df"])
+    prev_types = list(st.session_state.get("_comp_types") or [])
     edited = st.data_editor(
-        _as_comp_df(st.session_state["compartments_df"]),
+        current_df,
         num_rows="dynamic",
         hide_index=True,
         width="stretch",
@@ -2730,17 +2798,44 @@ elif nav == "appliance":
                 required=True,
                 width="medium",
             ),
+            "target_c": st.column_config.NumberColumn(
+                "Doel T (°C)",
+                help="Standaard de EN 62552-3 Tabel 1-waarde voor dit type. Mag je overschrijven.",
+                step=0.5,
+                format="%.1f",
+            ),
             "volume": st.column_config.NumberColumn(
                 "Volume (l)", min_value=0.0, step=1.0, format="%.1f"
             ),
             "sensors": st.column_config.TextColumn("Sensors (komma-gescheiden)", width="large"),
         },
     )
+    edited = _as_comp_df(edited)
+    type_changed = False
+    if prev_types and len(prev_types) == len(edited):
+        for i in range(len(edited)):
+            new_type = str(edited.at[i, "table_type"])
+            if str(prev_types[i]) != new_type:
+                edited.at[i, "target_c"] = _default_target_c(new_type)
+                type_changed = True
+    st.session_state["_comp_types"] = [str(t) for t in edited["table_type"]]
     st.session_state["compartments_df"] = edited
     st.session_state["compartments_ui"] = _compartment_records(edited)
+    if type_changed:
+        st.rerun()
     st.caption(
         f"{len(st.session_state['compartments_ui'])} compartiment(en). "
+        "Doeltemperatuur start op de Tabel 1-waarde; die kun je per rij wijzigen. "
         "Gebruik + onder de tabel of de knop hierboven om een rij toe te voegen."
+    )
+    st.number_input(
+        "Max. ΔT voor interpolatie (K)",
+        min_value=0.5,
+        max_value=20.0,
+        step=0.5,
+        format="%.1f",
+        key="interp_delta_t_k",
+        help="Annex E.3: interpolatie alleen als |T_onder − T_boven| niet groter is dan deze waarde. Standaard 4 K.",
     )
 
     st.text_input("Omgevingssensoren", key="ambient_sensors")
@@ -2858,8 +2953,8 @@ elif nav == "tests":
                         + (f", Δtrt uit meting ≈ {mean_trt:.2f} h" if mean_trt else "")
                     )
                 _render_provisional_defrost(test, p)
-            cols = st.columns(2)
-            if cols[0].button("Dit meetpunt analyseren", key=f"run_{i}"):
+            cols = st.columns(3)
+            if cols[0].button("Analyseren", key=f"run_{i}"):
                 st.session_state["active_test"] = i
                 try:
                     with st.spinner(f"Analyse van {test['name']}…"):
@@ -2870,9 +2965,23 @@ elif nav == "tests":
                     st.session_state["analyse_error"] = str(exc)
                 except Exception as exc:
                     st.session_state["analyse_error"] = str(exc)
+                _snapshot_analysis(test)
+                st.session_state["analyse_saved_select"] = i
                 st.session_state["pending_nav_tab"] = "analyse"
                 st.rerun()
-            if cols[1].button("Verwijderen", key=f"del_{i}"):
+            open_disabled = not _has_analysis(test)
+            if cols[1].button(
+                "Open resultaten",
+                key=f"open_{i}",
+                disabled=open_disabled,
+                help="Toon de laatst bewaarde analyse van dit meetpunt, zonder opnieuw te rekenen.",
+            ):
+                st.session_state["active_test"] = i
+                st.session_state["analyse_saved_select"] = i
+                _restore_analysis(test)
+                st.session_state["pending_nav_tab"] = "analyse"
+                st.rerun()
+            if cols[2].button("Verwijderen", key=f"del_{i}"):
                 st.session_state["tests"].pop(i)
                 st.rerun()
 
@@ -3052,7 +3161,28 @@ elif nav == "view":
                 )
 
 elif nav == "analyse":
-    st.subheader("Laatst geanalyseerde meting")
+    tests = st.session_state["tests"]
+    ready = [i for i, t in enumerate(tests) if _has_analysis(t)]
+    idx = st.session_state.get("active_test", 0)
+    if ready:
+        if idx not in ready:
+            idx = ready[0]
+        if st.session_state.get("analyse_saved_select") not in ready:
+            st.session_state["analyse_saved_select"] = idx
+        chosen = st.selectbox(
+            "Bewaarde analyse",
+            options=ready,
+            format_func=lambda i: (
+                f"{tests[i]['name']}  ({tests[i]['ambient_c']} °C, "
+                f"{VS_TARGET_OPTIONS.get(tests[i].get('vs_target', 'onder'), tests[i].get('vs_target'))})"
+            ),
+            key="analyse_saved_select",
+        )
+        st.session_state["active_test"] = chosen
+        _restore_analysis(tests[chosen])
+        st.subheader(tests[chosen]["name"])
+    else:
+        st.subheader("Analyse van één meting")
     if st.session_state.get("analyse_error"):
         st.error(st.session_state["analyse_error"])
     info = st.session_state["load_info"]
@@ -3277,6 +3407,10 @@ elif nav == "defrost":
 
 elif nav == "combine":
     st.subheader("Interpolatie per omgeving en jaarverbruik")
+    st.caption(
+        f"Max. ΔT tussen onder- en bovenmeting: {_interp_delta_t_k():g} K "
+        "(instelbaar bij Toestel)."
+    )
     points = collected_points()
     targets = targets_from_config()
     clf = campaign_defrost_classification()
@@ -3333,8 +3467,12 @@ elif nav == "combine":
             rows.append(row)
         st.dataframe(rows, width="stretch", hide_index=True)
 
-        r16 = en62552.resolve_ambient_edaily(points, targets, 16)
-        r32 = en62552.resolve_ambient_edaily(points, targets, 32)
+        r16 = en62552.resolve_ambient_edaily(
+            points, targets, 16, max_delta_t_k=_interp_delta_t_k()
+        )
+        r32 = en62552.resolve_ambient_edaily(
+            points, targets, 32, max_delta_t_k=_interp_delta_t_k()
+        )
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**16 °C**")

@@ -371,9 +371,11 @@ def linear_interpolate_case1(
     point1: TestPoint,
     point2: TestPoint,
     targets: dict[str, float],
+    max_delta_t_k: float = 4.0,
 ) -> InterpolationResult:
     """Annex E.3: lineaire interpolatie tussen twee meetpunten bij dezelfde Tamb."""
     messages: list[str] = []
+    limit = float(max_delta_t_k) if max_delta_t_k and max_delta_t_k > 0 else 4.0
     if abs(point1.ambient_c - point2.ambient_c) > 1.0:
         return InterpolationResult(
             False,
@@ -391,9 +393,9 @@ def linear_interpolate_case1(
         t1 = point1.temps_c[i_name]
         t2 = point2.temps_c[i_name]
         t_tar = targets[i_name]
-        if abs(t1 - t2) > 4.0:
+        if abs(t1 - t2) > limit:
             messages.append(
-                f"{i_name}: |T1−T2|={abs(t1 - t2):.2f} K > 4 K — geen interpolatie op dit compartiment."
+                f"{i_name}: |T1−T2|={abs(t1 - t2):.2f} K > {limit:g} K — geen interpolatie op dit compartiment."
             )
             if t1 <= t_tar and t2 <= t_tar:
                 messages.append(f"{i_name}: beide punten liggen al op/onder target.")
@@ -434,7 +436,7 @@ def linear_interpolate_case1(
             messages=messages
             + [
                 "Geen geldige interpolatie: nodig is één meting kouder dan target en "
-                "één warmer, met de doeltemperatuur ertussen (geen extrapolatie, ΔT ≤ 4 K)."
+                f"één warmer, met de doeltemperatuur ertussen (geen extrapolatie, ΔT ≤ {limit:g} K)."
             ],
         )
 
@@ -459,6 +461,7 @@ def resolve_ambient_edaily(
     points: list[TestPoint],
     targets: dict[str, float],
     ambient_c: float,
+    max_delta_t_k: float = 4.0,
 ) -> InterpolationResult:
     """Edaily bij doeltemperatuur via interpolatie onder/boven target (Annex E.3)."""
     group = [p for p in points if abs(p.ambient_c - ambient_c) <= 1.0]
@@ -486,7 +489,9 @@ def resolve_ambient_edaily(
     best: InterpolationResult | None = None
     for p1 in below:
         for p2 in above:
-            result = linear_interpolate_case1(p1, p2, targets)
+            result = linear_interpolate_case1(
+                p1, p2, targets, max_delta_t_k=max_delta_t_k
+            )
             if result.valid and (
                 best is None
                 or (result.edaily_wh is not None and result.edaily_wh < (best.edaily_wh or 1e18))
@@ -500,7 +505,7 @@ def resolve_ambient_edaily(
         "ongeldig",
         messages=[
             f"Onder/boven-punten bij {ambient_c:.0f} °C geven geen geldige interpolatie "
-            "(doeltemperatuur niet tussen de gemeten T, of |ΔT| > 4 K)."
+            f"(doeltemperatuur niet tussen de gemeten T, of |ΔT| > {float(max_delta_t_k):g} K)."
         ],
     )
 
@@ -510,7 +515,11 @@ def annual_energy_europe_kwh(edaily_16_kwh: float, edaily_32_kwh: float) -> floa
     return DAYS_AT_16_C * edaily_16_kwh + DAYS_AT_32_C * edaily_32_kwh
 
 
-def campaign_status(points: list[TestPoint], targets: dict[str, float]) -> list[dict]:
+def campaign_status(
+    points: list[TestPoint],
+    targets: dict[str, float],
+    max_delta_t_k: float = 4.0,
+) -> list[dict]:
     """Checklist: interpolatie onder/boven target bij 16 °C en 32 °C."""
 
     def _count(amb: float, side: str) -> int:
@@ -522,8 +531,16 @@ def campaign_status(points: list[TestPoint], targets: dict[str, float]) -> list[
 
     n16_lo, n16_hi = _count(16, "onder"), _count(16, "boven")
     n32_lo, n32_hi = _count(32, "onder"), _count(32, "boven")
-    r16 = resolve_ambient_edaily(points, targets, 16) if n16_lo and n16_hi else None
-    r32 = resolve_ambient_edaily(points, targets, 32) if n32_lo and n32_hi else None
+    r16 = (
+        resolve_ambient_edaily(points, targets, 16, max_delta_t_k=max_delta_t_k)
+        if n16_lo and n16_hi
+        else None
+    )
+    r32 = (
+        resolve_ambient_edaily(points, targets, 32, max_delta_t_k=max_delta_t_k)
+        if n32_lo and n32_hi
+        else None
+    )
     return [
         {
             "id": "t16_lo",
