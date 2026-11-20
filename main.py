@@ -1274,90 +1274,125 @@ def annotate_ss1_periods(df: pl.DataFrame) -> pl.DataFrame:
             else pl.lit(None)
         ),
     )
+    lf = lf.with_columns(
+        ok_self=(
+            pl.col("ok_duration")
+            & pl.col("ok_temp_spread")
+            & pl.col("ok_power_spread")
+            & pl.col("ok_power_slope")
+        ),
+        own_fail=pl.concat_str(
+            [
+                pl.when(~pl.col("ok_duration"))
+                .then(
+                    pl.format("duur {} h < 6 h", pl.col("period_hours").round(2))
+                )
+                .otherwise(pl.lit("")),
+                pl.when(~pl.col("ok_temp_spread"))
+                .then(
+                    pl.format(
+                        "temp-spread {} K ≥ 0,25 K",
+                        pl.col("max_temp_spread_K").round(3),
+                    )
+                )
+                .otherwise(pl.lit("")),
+                pl.when(~pl.col("ok_power_spread"))
+                .then(
+                    pl.format(
+                        "P-spread {} % > limiet {} %",
+                        pl.col("power_spread_pct").round(3),
+                        pl.col("power_spread_limit_pct").round(3),
+                    )
+                )
+                .otherwise(pl.lit("")),
+                pl.when(~pl.col("ok_power_slope"))
+                .then(
+                    pl.format(
+                        "|P-helling| {} %/h ≥ 0,25 %/h",
+                        pl.col("power_slope_pct").abs().round(4),
+                    )
+                )
+                .otherwise(pl.lit("")),
+            ],
+            separator="; ",
+        ),
+    )
+    lf = lf.with_columns(
+        own_fail=pl.col("own_fail")
+        .str.replace_all(r"(^; )|(; $)|(; ){2,}", "; ")
+        .str.strip_chars("; ")
+    )
+    group = ("N_TCC_per_block", "streak_id")
     lf = (
         lf.sort(["streak_id", "N_TCC_per_block", "start_TCC_id"])
         .with_columns(
-            prev_two_periods_also_valid=(
-                pl.col("start_TCC_id")
-                == (
-                    pl.col("start_TCC_id")
-                    .shift(1)
-                    .over("N_TCC_per_block", "streak_id")
-                    + 1
-                )
-            )
-            & (
-                pl.col("start_TCC_id")
-                == (
-                    pl.col("start_TCC_id")
-                    .shift(2)
-                    .over("N_TCC_per_block", "streak_id")
-                    + 2
-                )
-            )
+            _ok_self_m1=pl.col("ok_self").shift(1).over(*group),
+            _ok_self_m2=pl.col("ok_self").shift(2).over(*group),
+            _start_m1=pl.col("start_TCC_id").shift(1).over(*group),
+            _start_m2=pl.col("start_TCC_id").shift(2).over(*group),
+            _own_fail_m1=pl.col("own_fail").shift(1).over(*group),
+            _own_fail_m2=pl.col("own_fail").shift(2).over(*group),
         )
         .with_columns(
-            pl.col("prev_two_periods_also_valid").fill_null(False),
+            prev1_exists=pl.col("start_TCC_id") == (pl.col("_start_m1") + 1),
+            prev2_exists=pl.col("start_TCC_id") == (pl.col("_start_m2") + 2),
         )
         .with_columns(
-            ok_ss1=(
-                pl.col("ok_duration")
-                & pl.col("ok_temp_spread")
-                & pl.col("ok_power_spread")
-                & pl.col("ok_power_slope")
-                & pl.col("prev_two_periods_also_valid")
-            )
+            prev1_exists=pl.col("prev1_exists").fill_null(False),
+            prev2_exists=pl.col("prev2_exists").fill_null(False),
+            prev1_ok=pl.col("prev1_exists")
+            & pl.col("_ok_self_m1").fill_null(False),
+            prev2_ok=pl.col("prev2_exists")
+            & pl.col("_ok_self_m2").fill_null(False),
         )
         .with_columns(
-            fail_reason=pl.concat_str(
+            prev_two_periods_also_valid=pl.col("prev1_ok") & pl.col("prev2_ok"),
+            prev_fail=pl.concat_str(
                 [
-                    pl.when(~pl.col("ok_duration"))
+                    pl.when(~pl.col("prev1_exists"))
+                    .then(pl.lit("start−1 ontbreekt"))
+                    .when(~pl.col("prev1_ok"))
                     .then(
                         pl.format(
-                            "duur {} h < 6 h",
-                            pl.col("period_hours").round(2),
+                            "start−1 voldoet niet ({})",
+                            pl.col("_own_fail_m1").fill_null("geen SS1-eisen"),
                         )
                     )
                     .otherwise(pl.lit("")),
-                    pl.when(~pl.col("ok_temp_spread"))
+                    pl.when(~pl.col("prev2_exists"))
+                    .then(pl.lit("start−2 ontbreekt"))
+                    .when(~pl.col("prev2_ok"))
                     .then(
                         pl.format(
-                            "temp-spread {} K ≥ 0,25 K",
-                            pl.col("max_temp_spread_K").round(3),
+                            "start−2 voldoet niet ({})",
+                            pl.col("_own_fail_m2").fill_null("geen SS1-eisen"),
                         )
                     )
-                    .otherwise(pl.lit("")),
-                    pl.when(~pl.col("ok_power_spread"))
-                    .then(
-                        pl.format(
-                            "P-spread {} % > limiet {} %",
-                            pl.col("power_spread_pct").round(3),
-                            pl.col("power_spread_limit_pct").round(3),
-                        )
-                    )
-                    .otherwise(pl.lit("")),
-                    pl.when(~pl.col("ok_power_slope"))
-                    .then(
-                        pl.format(
-                            "|P-helling| {} %/h ≥ 0,25 %/h",
-                            pl.col("power_slope_pct").abs().round(4),
-                        )
-                    )
-                    .otherwise(pl.lit("")),
-                    pl.when(~pl.col("prev_two_periods_also_valid"))
-                    .then(pl.lit("start−1 en start−2 niet beide geldig"))
                     .otherwise(pl.lit("")),
                 ],
                 separator="; ",
-            )
+            ),
         )
         .with_columns(
-            fail_reason=pl.col("fail_reason").str.replace_all(r"(^; )|(; $)|(; ){2,}", "; ").str.strip_chars("; ")
+            ok_ss1=pl.col("ok_self") & pl.col("prev_two_periods_also_valid"),
+            fail_reason=pl.concat_str(
+                [pl.col("own_fail"), pl.col("prev_fail")],
+                separator="; ",
+            ),
+        )
+        .with_columns(
+            fail_reason=pl.col("fail_reason")
+            .str.replace_all(r"(^; )|(; $)|(; ){2,}", "; ")
+            .str.strip_chars("; ")
         )
         .with_columns(
             fail_reason=pl.when(pl.col("ok_ss1"))
             .then(pl.lit("voldoet"))
-            .otherwise(pl.col("fail_reason"))
+            .otherwise(
+                pl.when(pl.col("fail_reason") == "")
+                .then(pl.lit("voldoet niet"))
+                .otherwise(pl.col("fail_reason"))
+            )
         )
         .sort(
             [

@@ -83,6 +83,41 @@ NAV_TABS = [
 NAV_LABELS = dict(NAV_TABS)
 _TESTPOINT_FIELDS = {f.name for f in fields(en62552.TestPoint)}
 _SETTINGS_VERSION = 3
+_PERSIST_PREFIX = "_persist_"
+_APPLIANCE_FIELDS = {
+    "ambient_sensors": "205 (C), 210 (C), 204 (C)",
+    "gradient_sensors": "110 (C), 206 (C)",
+    "defrost_power_w": 50.0,
+    "interp_delta_t_k": 4.0,
+    "heater_advances_timer": False,
+}
+
+
+def _persist_key(key: str) -> str:
+    return f"{_PERSIST_PREFIX}{key}"
+
+
+def _persist_get(key: str, default=None):
+    stored = st.session_state.get(_persist_key(key))
+    if stored is not None:
+        return stored
+    if key in st.session_state and st.session_state.get(key) is not None:
+        return st.session_state[key]
+    return default
+
+
+def _persist_set(key: str, value) -> None:
+    st.session_state[_persist_key(key)] = value
+    st.session_state[key] = value
+
+
+def _restore_persisted_settings() -> None:
+    for key, default in _APPLIANCE_FIELDS.items():
+        value = st.session_state.get(_persist_key(key))
+        if value is None:
+            value = st.session_state.get(key, default)
+            st.session_state[_persist_key(key)] = value
+        st.session_state[key] = value
 
 
 def _blank_test(
@@ -213,13 +248,7 @@ def _init_state() -> None:
     st.session_state["compartments_ui"] = _compartment_records(
         _as_comp_df(st.session_state["compartments_df"])
     )
-    st.session_state.setdefault(
-        "ambient_sensors", "205 (C), 210 (C), 204 (C)"
-    )
-    st.session_state.setdefault("gradient_sensors", "110 (C), 206 (C)")
-    st.session_state.setdefault("heater_advances_timer", False)
-    st.session_state.setdefault("defrost_power_w", 50.0)
-    st.session_state.setdefault("interp_delta_t_k", 4.0)
+    _restore_persisted_settings()
     st.session_state.setdefault("tests", _default_tests())
     _migrate_tests(st.session_state["tests"])
     st.session_state.setdefault("active_test", 0)
@@ -258,7 +287,6 @@ def _init_state() -> None:
     pending_power = st.session_state.pop("pending_power_folder", None)
     if pending_power is not None:
         _apply_campaign_power(pending_power)
-        st.session_state["power_folder_text"] = st.session_state.get("power_folder") or ""
     pending_temp_folder = st.session_state.pop("pending_temp_folder", None)
     if pending_temp_folder is not None:
         index, folder = pending_temp_folder
@@ -279,9 +307,10 @@ def _init_state() -> None:
     if st.session_state.pop("pending_reload_folders", None):
         notes = _reload_configured_folders()
         st.session_state["flash"] = "Mappen opnieuw ingelezen. " + " | ".join(notes[:2])
+    saved_power = _stored_power_folder()
+    if saved_power:
+        _set_stored_power_folder(saved_power)
     _ensure_campaign_power()
-    if "power_folder_text" not in st.session_state:
-        st.session_state["power_folder_text"] = st.session_state.get("power_folder") or ""
 
 
 ANALYSIS_SNAPSHOT_KEYS = (
@@ -307,7 +336,7 @@ ANALYSIS_SNAPSHOT_KEYS = (
 
 def _interp_delta_t_k() -> float:
     try:
-        value = float(st.session_state.get("interp_delta_t_k", 4.0))
+        value = float(_persist_get("interp_delta_t_k", 4.0))
     except (TypeError, ValueError):
         value = 4.0
     return value if value > 0 else 4.0
@@ -383,6 +412,268 @@ def _thin_df(df: pl.DataFrame, n_max: int = 15000) -> pl.DataFrame:
         return df
     step = max(1, int((df.height + n_max - 1) / n_max))
     return df.gather_every(step)
+
+
+def _tcc_block_geom(df_tcc: pl.DataFrame, t0: int, t1: int) -> dict | None:
+    if df_tcc is None or t1 < t0:
+        return None
+    part = df_tcc.filter((pl.col("TCC_id") >= t0) & (pl.col("TCC_id") <= t1)).sort("TCC_id")
+    if part.height == 0:
+        return None
+    start = part["TCC_start_datetime"].min()
+    einde = part["TCC_end_datetime"].max() if "TCC_end_datetime" in part.columns else start
+    mid = start
+    if start is not None and einde is not None:
+        try:
+            mid = start + (einde - start) / 2
+        except Exception:
+            mid = start
+    power = None
+    if analysis.power_col in part.columns:
+        power = float(part[analysis.power_col].mean())
+    temps = {
+        c.replace("temp_mean_", ""): float(part[c].mean())
+        for c in part.columns
+        if str(c).startswith("temp_mean_")
+    }
+    return {
+        "t0": t0,
+        "t1": t1,
+        "start": start,
+        "einde": einde,
+        "mid": mid,
+        "power": power,
+        "temps": temps,
+    }
+
+
+def _ss1_window_blocks(start: int, n: int, df_tcc: pl.DataFrame) -> list[dict]:
+    if n <= 0:
+        return []
+    out = []
+    for i, label in enumerate(("A", "B", "C")):
+        geom = _tcc_block_geom(df_tcc, start + i * n, start + (i + 1) * n - 1)
+        if geom:
+            geom["blok"] = label
+            out.append(geom)
+    return out
+
+
+def _lookup_ss1_period(diag, n: int, start: int, streak=None) -> dict | None:
+    if diag is None or getattr(diag, "height", 0) == 0:
+        return None
+    hit = diag.filter(
+        (pl.col("N_TCC_per_block") == n) & (pl.col("start_TCC_id") == start)
+    )
+    if streak is not None and "streak_id" in diag.columns:
+        hit = hit.filter(pl.col("streak_id") == streak)
+    if hit.height == 0:
+        return None
+    return hit.row(0, named=True)
+
+
+def _plotly_ss1_candidate(rec: dict) -> go.Figure | None:
+    df_tcc = st.session_state.get("df_TCC_w_streaks_and_means")
+    plot_data = st.session_state.get("plot_data") or {}
+    df_p = plot_data.get("df_meas_data_w_median")
+    if df_tcc is None:
+        return None
+    n = int(rec.get("N_TCC_per_block") or 0)
+    start = int(rec.get("start_TCC_id") or 0)
+    if n <= 0:
+        return None
+    current = _ss1_window_blocks(start, n, df_tcc)
+    minus1 = _ss1_window_blocks(start - 1, n, df_tcc)
+    minus2 = _ss1_window_blocks(start - 2, n, df_tcc)
+    spans = []
+    for label, blocks, color in (
+        ("start−2", minus2, "#8e44ad"),
+        ("start−1", minus1, "#e67e22"),
+        ("deze periode", current, "#1a5276"),
+    ):
+        if not blocks:
+            continue
+        spans.append(
+            {
+                "label": label,
+                "start": blocks[0]["start"],
+                "einde": blocks[-1]["einde"],
+                "color": color,
+                "blocks": blocks,
+            }
+        )
+    t_lo = min((s["start"] for s in spans if s["start"] is not None), default=None)
+    t_hi = max((s["einde"] for s in spans if s["einde"] is not None), default=None)
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=("Vermogen P (blokken + helling A→C)", "Temperatuur T (helling A→C)"),
+        row_heights=[0.5, 0.5],
+    )
+    time_c = analysis.time_col
+    p_smooth = analysis.val_col_smooth_short
+    p_raw = analysis.val_col
+    if df_p is not None and time_c in df_p.columns:
+        df_show = _thin_df(
+            df_p.select([c for c in (time_c, p_raw, p_smooth) if c in df_p.columns]).sort(time_c)
+        )
+        x_p = df_show[time_c].to_list()
+        if p_raw in df_show.columns:
+            fig.add_trace(
+                go.Scattergl(
+                    x=x_p,
+                    y=df_show[p_raw].to_list(),
+                    name="P (ruw)",
+                    mode="lines",
+                    line=dict(width=0.7, color="#b0b7bd"),
+                    hovertemplate="%{x}<br>P=%{y:.3f} W<extra>P ruw</extra>",
+                ),
+                row=1,
+                col=1,
+            )
+        if p_smooth in df_show.columns:
+            fig.add_trace(
+                go.Scattergl(
+                    x=x_p,
+                    y=df_show[p_smooth].to_list(),
+                    name="P (mediaan)",
+                    mode="lines",
+                    line=dict(width=1.1, color="#7f8c8d"),
+                    hovertemplate="%{x}<br>P=%{y:.3f} W<extra>P glad</extra>",
+                ),
+                row=1,
+                col=1,
+            )
+    if analysis.power_col in df_tcc.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df_tcc["TCC_start_datetime"].to_list(),
+                y=df_tcc[analysis.power_col].to_list(),
+                name="P per TCC",
+                mode="markers",
+                marker=dict(size=5, color="#1a5276"),
+                hovertemplate="%{x}<br>P TCC=%{y:.3f} W<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+    temp_cols = [c for c in df_tcc.columns if str(c).startswith("temp_mean_")]
+    x_t = df_tcc["TCC_start_datetime"].to_list()
+    for col in temp_cols:
+        label = col.replace("temp_mean_", "T ")
+        fig.add_trace(
+            go.Scatter(
+                x=x_t,
+                y=df_tcc[col].to_list(),
+                name=label,
+                mode="lines+markers",
+                marker=dict(size=4),
+                hovertemplate="%{x}<br>" + label + "=%{y:.3f} °C<extra></extra>",
+            ),
+            row=2,
+            col=1,
+        )
+
+    for span in spans:
+        if span["start"] is None or span["einde"] is None:
+            continue
+        for row in (1, 2):
+            fig.add_vrect(
+                x0=span["start"],
+                x1=span["einde"],
+                fillcolor=span["color"],
+                opacity=0.10,
+                line_width=0,
+                annotation_text=span["label"] if row == 1 else None,
+                annotation_position="top left",
+                row=row,
+                col=1,
+            )
+    block_colors = {"A": "#5dade2", "B": "#58d68d", "C": "#f5b041"}
+    for blk in current:
+        if blk["start"] is None or blk["einde"] is None:
+            continue
+        fig.add_vrect(
+            x0=blk["start"],
+            x1=blk["einde"],
+            fillcolor=block_colors.get(blk["blok"], "#aab7b8"),
+            opacity=0.22,
+            line_width=0,
+            annotation_text=f"blok {blk['blok']}",
+            annotation_position="top left",
+            row=1,
+            col=1,
+        )
+        fig.add_vrect(
+            x0=blk["start"],
+            x1=blk["einde"],
+            fillcolor=block_colors.get(blk["blok"], "#aab7b8"),
+            opacity=0.16,
+            line_width=0,
+            row=2,
+            col=1,
+        )
+
+    slope_specs = (
+        ("start−2", minus2, "#8e44ad"),
+        ("start−1", minus1, "#e67e22"),
+        ("deze", current, "#c0392b"),
+    )
+    for name, blocks, color in slope_specs:
+        if len(blocks) < 3:
+            continue
+        a, c = blocks[0], blocks[2]
+        if a.get("mid") is None or c.get("mid") is None:
+            continue
+        if a.get("power") is not None and c.get("power") is not None:
+            fig.add_trace(
+                go.Scatter(
+                    x=[a["mid"], c["mid"]],
+                    y=[a["power"], c["power"]],
+                    name=f"P-helling {name}",
+                    mode="lines+markers",
+                    line=dict(width=3, color=color, dash="solid"),
+                    marker=dict(size=8, color=color),
+                    hovertemplate="%{x}<br>P=%{y:.3f} W<extra>" + name + "</extra>",
+                ),
+                row=1,
+                col=1,
+            )
+        temp_names = sorted(set(a.get("temps") or {}) & set(c.get("temps") or {}))
+        for tname in temp_names[:4]:
+            fig.add_trace(
+                go.Scatter(
+                    x=[a["mid"], c["mid"]],
+                    y=[a["temps"][tname], c["temps"][tname]],
+                    name=f"T-helling {tname} {name}",
+                    mode="lines",
+                    line=dict(width=2, color=color, dash="dash"),
+                    hovertemplate="%{x}<br>T=%{y:.3f} °C<extra>" + tname + " " + name + "</extra>",
+                    legendgroup=f"tslope-{name}",
+                ),
+                row=2,
+                col=1,
+            )
+
+    if t_lo is not None and t_hi is not None:
+        try:
+            pad = (t_hi - t_lo) * 0.15
+            fig.update_xaxes(range=[t_lo - pad, t_hi + pad])
+        except Exception:
+            pass
+    fig.update_yaxes(title_text="W", row=1, col=1)
+    fig.update_yaxes(title_text="°C", row=2, col=1)
+    fig.update_xaxes(title_text="Tijd", row=2, col=1)
+    fig.update_layout(
+        height=680,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0, font=dict(size=11)),
+        margin=dict(l=50, r=20, t=50, b=40),
+    )
+    return fig
 
 
 def _ss1_blocks(ss1: dict, df_tcc: pl.DataFrame) -> list[dict]:
@@ -1012,7 +1303,7 @@ def _render_ss1_tcc_context() -> None:
         f"**Geen 3-blok-perioden gebouwd.** {n_tcc} compressorcyclus/cycli in "
         f"{n_streaks or 'onbekend aantal'} streak(s). Een SS1-periode is drie "
         "opeenvolgende blokken van n cycli; streaks van 1 cyclus (vaak omdat elke "
-        f"cyclus als ontdooi telt, drempel P > {float(st.session_state.get('defrost_power_w', 50.0)):g} W) vallen af. Na het weglaten van "
+        f"cyclus als ontdooi telt, drempel P > {float(_persist_get('defrost_power_w', 50.0)):g} W) vallen af. Na het weglaten van "
         "de eerste twee en laatste TCC van een streak blijven er minstens 3 cycli nodig."
     )
     if means is None or getattr(means, "height", 0) == 0:
@@ -1055,6 +1346,98 @@ def _render_ss1_tcc_context() -> None:
         st.dataframe(means.select(show).to_pandas(), hide_index=True, width="stretch")
 
 
+def _ss1_selection_rows(event) -> list[int]:
+    if event is None:
+        return []
+    sel = getattr(event, "selection", None)
+    if sel is None:
+        return []
+    rows = getattr(sel, "rows", None)
+    if rows is None and isinstance(sel, dict):
+        rows = sel.get("rows")
+    return [int(i) for i in (rows or [])]
+
+
+def _ss1_neighbor_summary(diag, rec: dict, offset: int) -> dict:
+    n = int(rec.get("N_TCC_per_block") or 0)
+    start = int(rec.get("start_TCC_id") or 0)
+    streak = rec.get("streak_id")
+    label = f"start{offset:+d}"
+    if offset == 0:
+        label = "deze periode"
+        neigh = rec
+    else:
+        neigh = _lookup_ss1_period(diag, n, start + offset, streak)
+    if not neigh:
+        return {
+            "Venster": label,
+            "Start TCC": start + offset,
+            "Duur (h)": "—",
+            "P-helling (%/h)": "—",
+            "T-spread (K)": "—",
+            "SS1 zelf": "ontbreekt",
+            "Waarom niet": "geen periode op deze start",
+        }
+    ok_self = bool(neigh.get("ok_self", neigh.get("ok_ss1")))
+    t_spread = neigh.get("max_temp_spread_K")
+    return {
+        "Venster": label,
+        "Start TCC": neigh.get("start_TCC_id"),
+        "Duur (h)": round(float(neigh.get("period_hours") or 0), 3),
+        "P-helling (%/h)": round(float(neigh.get("power_slope_pct") or 0), 4),
+        "T-spread (K)": (
+            None if t_spread is None else round(float(t_spread), 4)
+        ),
+        "SS1 zelf": "ja" if ok_self else "nee",
+        "Waarom niet": "" if ok_self else (neigh.get("own_fail") or neigh.get("fail_reason") or ""),
+    }
+
+
+def _render_ss1_candidate_detail(rec: dict, diag) -> None:
+    n = int(rec.get("N_TCC_per_block") or 0)
+    start = int(rec.get("start_TCC_id") or 0)
+    st.markdown(
+        f"**n = {n}** TCC/blok, start **TCC {start}** t/m **TCC {start + 3 * n - 1}**.  \n"
+        f"{rec.get('fail_reason') or ''}"
+    )
+    st.dataframe(
+        [
+            _ss1_neighbor_summary(diag, rec, 0),
+            _ss1_neighbor_summary(diag, rec, -1),
+            _ss1_neighbor_summary(diag, rec, -2),
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+    fig = _plotly_ss1_candidate(rec)
+    if fig is not None:
+        st.plotly_chart(fig, width="stretch")
+    else:
+        st.info("Geen TCC-data om de blokken te tekenen.")
+
+
+def _ss1_candidate_dialog_body() -> None:
+    rec = st.session_state.get("_ss1_dialog_rec") or {}
+    diag = st.session_state.get("ss1_diagnostics")
+    _render_ss1_candidate_detail(rec, diag)
+    if st.button("Sluiten", key="ss1_dialog_close"):
+        st.session_state["_ss1_dialog_dismissed"] = st.session_state.get("_ss1_dialog_sel")
+        st.rerun()
+
+
+if hasattr(st, "dialog"):
+    try:
+        _ss1_candidate_dialog = st.dialog(
+            "Kandidaatperiode SS1", width="large"
+        )(_ss1_candidate_dialog_body)
+    except TypeError:
+        _ss1_candidate_dialog = st.dialog("Kandidaatperiode SS1")(
+            _ss1_candidate_dialog_body
+        )
+else:
+    _ss1_candidate_dialog = _ss1_candidate_dialog_body
+
+
 def _ss1_diag_display(diag) -> None:
     if diag is None or getattr(diag, "height", 0) == 0:
         _render_ss1_tcc_context()
@@ -1068,8 +1451,9 @@ def _ss1_diag_display(diag) -> None:
     c4.metric("|P-helling| OK", str(summary.get("n_ok_power_slope", "—")))
     c5.metric("Start−1/−2 OK", str(summary.get("n_ok_prev_two", "—")))
     pdf = diag.head(80).to_pandas()
+    records = pdf.to_dict("records")
     rows = []
-    for rec in pdf.to_dict("records"):
+    for rec in records:
         rows.append(
             {
                 "Start TCC": rec.get("start_TCC_id"),
@@ -1090,16 +1474,37 @@ def _ss1_diag_display(diag) -> None:
                     if rec.get("max_temp_slope_K_per_h") is None
                     else round(float(rec.get("max_temp_slope_K_per_h")), 4)
                 ),
+                "Start−1/−2": "ja" if rec.get("prev_two_periods_also_valid") else "nee",
                 "SS1": "ja" if rec.get("ok_ss1") else "nee",
                 "Waarom niet": rec.get("fail_reason") or "",
             }
         )
-    st.dataframe(rows, hide_index=True, width="stretch")
-    st.caption(
-        "Eis: duur ≥ 6 h, temp-spread < 0,25 K, |P-helling| < 0,25 %/h, "
-        "P-spread volgens duurklasse, en de perioden die 1 en 2 TCC eerder starten "
-        "moeten ook aan die eisen voldoen. Maximaal 80 rijen, best-eerst."
+    table = pd.DataFrame(rows)
+    event = st.dataframe(
+        table,
+        hide_index=True,
+        width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
+        key="ss1_diag_pick",
     )
+    st.caption(
+        "Klik een rij voor een popup met blokken A/B/C, vensters start−1 en start−2, "
+        "en de hellingen (A→C). **Waarom niet** noemt nu ook als start−1 of start−2 "
+        "zelf niet aan de SS1-eisen voldoet. Start−1/−2 = ja alleen als beide eerdere "
+        "perioden zelf stabiel zijn. Maximaal 80 rijen, best-eerst."
+    )
+    sel = _ss1_selection_rows(event)
+    if sel and 0 <= sel[0] < len(records):
+        key = (
+            int(records[sel[0]].get("start_TCC_id") or 0),
+            int(records[sel[0]].get("N_TCC_per_block") or 0),
+            sel[0],
+        )
+        st.session_state["_ss1_dialog_sel"] = key
+        if st.session_state.get("_ss1_dialog_dismissed") != key:
+            st.session_state["_ss1_dialog_rec"] = records[sel[0]]
+            _ss1_candidate_dialog()
 
 
 def _render_ss1_decision() -> None:
@@ -1458,17 +1863,33 @@ def _default_power_folder() -> str:
     return ""
 
 
-def _ensure_campaign_power() -> None:
-    folder = _norm_path(st.session_state.get("power_folder"))
+def _stored_power_folder() -> str:
+    for key in ("campaign_power_folder", "power_folder", "_power_folder_saved"):
+        value = _norm_path(st.session_state.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _set_stored_power_folder(folder: str) -> None:
+    folder = _norm_path(folder)
+    st.session_state["campaign_power_folder"] = folder
+    st.session_state["power_folder"] = folder
     if folder:
-        resolved = _resolve_configured_path(folder)
-        st.session_state["power_folder"] = resolved or folder
-        st.session_state["power_pool"] = _list_power_files(resolved or folder)
+        st.session_state["_power_folder_saved"] = folder
+
+
+def _ensure_campaign_power() -> None:
+    folder = _stored_power_folder()
+    if folder:
+        resolved = _resolve_configured_path(folder) or folder
+        _set_stored_power_folder(resolved)
+        st.session_state["power_pool"] = _list_power_files(resolved)
         return
     pool = [p for p in (st.session_state.get("power_pool") or []) if Path(p).is_file()]
     if pool:
         st.session_state["power_pool"] = pool
-        st.session_state["power_folder"] = str(Path(pool[0]).parent)
+        _set_stored_power_folder(str(Path(pool[0]).parent))
         return
     for t in st.session_state.get("tests") or []:
         legacy = t.get("power_pool") or t.get("power_paths")
@@ -1476,18 +1897,18 @@ def _ensure_campaign_power() -> None:
             files = [p for p in legacy if Path(p).is_file()]
             if files:
                 st.session_state["power_pool"] = files
-                st.session_state["power_folder"] = str(Path(files[0]).parent)
+                _set_stored_power_folder(str(Path(files[0]).parent))
                 return
         pattern = t.get("power_glob") or ""
         if pattern:
             files = _list_power_files(pattern)
             if files:
                 st.session_state["power_pool"] = files
-                st.session_state["power_folder"] = str(Path(files[0]).parent)
+                _set_stored_power_folder(str(Path(files[0]).parent))
                 return
     default = _default_power_folder()
     if default:
-        st.session_state["power_folder"] = default
+        _set_stored_power_folder(default)
         st.session_state["power_pool"] = _list_power_files(default)
 
 
@@ -1495,7 +1916,7 @@ def _campaign_power_pool() -> list[str]:
     pool = [p for p in (st.session_state.get("power_pool") or []) if Path(p).is_file()]
     if pool:
         return pool
-    folder = st.session_state.get("power_folder") or ""
+    folder = _stored_power_folder()
     if folder:
         return _list_power_files(folder)
     return []
@@ -1552,18 +1973,21 @@ def _apply_campaign_power(paths: list[str] | str) -> None:
         files = _list_power_files(configured) if configured else []
         st.session_state["power_pool"] = files
         if configured:
-            st.session_state["power_folder"] = configured
+            _set_stored_power_folder(configured)
         elif files:
-            st.session_state["power_folder"] = str(Path(files[0]).parent)
+            _set_stored_power_folder(str(Path(files[0]).parent))
         else:
-            st.session_state["power_folder"] = ""
+            _set_stored_power_folder("")
     else:
         files = _list_power_files(paths)
         st.session_state["power_pool"] = files
         if files:
-            st.session_state["power_folder"] = str(Path(files[0]).parent)
-        elif not st.session_state.get("power_folder"):
-            st.session_state["power_folder"] = ""
+            _set_stored_power_folder(str(Path(files[0]).parent))
+        elif not _stored_power_folder():
+            _set_stored_power_folder("")
+    remembered = _stored_power_folder()
+    if remembered:
+        st.session_state["_power_folder_saved"] = remembered
     glob = (
         str(Path(st.session_state["power_folder"]) / "*")
         if st.session_state.get("power_folder")
@@ -1623,16 +2047,11 @@ def _apply_temp_folder(
 
 
 def _sync_folder_widgets_into_state() -> None:
-    text = st.session_state.get("power_folder_text")
-    if text is not None:
-        st.session_state["power_folder"] = _norm_path(text)
-    for i, test in enumerate(st.session_state.get("tests") or []):
-        tf = st.session_state.get(f"tf_{i}")
-        if tf is not None:
-            test["temp_folder"] = _norm_path(tf)
-        tfile = st.session_state.get(f"t_{i}")
-        if tfile is not None:
-            test["temp_file"] = _norm_path(tfile)
+    # Widget keys are not the source of truth: Streamlit deletes them on tab change.
+    folder = _stored_power_folder()
+    if folder:
+        _set_stored_power_folder(folder)
+    for test in st.session_state.get("tests") or []:
         if test.get("temp_file") and not test.get("temp_folder"):
             parent = Path(test["temp_file"]).parent
             if str(parent) not in {"", "."}:
@@ -1673,25 +2092,26 @@ def _reload_configured_folders() -> list[str]:
             notes.append(f"{label}: map gevonden, nog geen temperatuurbestand — {folder}")
         else:
             notes.append(f"{label}: geen temperatuurmap in de JSON.")
-    st.session_state["power_folder_text"] = resolved_power
+    if resolved_power:
+        _set_stored_power_folder(resolved_power)
     st.session_state["folder_status"] = notes
     return notes
 
 
 def _campaign_settings() -> dict:
     _sync_folder_widgets_into_state()
-    power_folder = _norm_path(st.session_state.get("power_folder"))
+    power_folder = _stored_power_folder()
     return {
         "version": _SETTINGS_VERSION,
         "power_folder": power_folder,
         "power_glob": str(Path(power_folder) / "*") if power_folder else "",
         "settings_path": _norm_path(st.session_state.get("settings_path")),
         "compartments": _compartment_records(_as_comp_df(st.session_state["compartments_df"])),
-        "ambient_sensors": st.session_state.get("ambient_sensors"),
-        "gradient_sensors": st.session_state.get("gradient_sensors"),
-        "defrost_power_w": st.session_state.get("defrost_power_w"),
+        "ambient_sensors": _persist_get("ambient_sensors"),
+        "gradient_sensors": _persist_get("gradient_sensors"),
+        "defrost_power_w": _persist_get("defrost_power_w"),
         "interp_delta_t_k": _interp_delta_t_k(),
-        "heater_advances_timer": st.session_state.get("heater_advances_timer"),
+        "heater_advances_timer": bool(_persist_get("heater_advances_timer", False)),
         "tests": [
             {
                 "id": t.get("id"),
@@ -1731,13 +2151,13 @@ def _apply_campaign_settings(data: dict) -> None:
         st.session_state["compartments_ui"] = _compartment_records(_as_comp_df(comps))
     for key in ("ambient_sensors", "gradient_sensors"):
         if data.get(key) is not None:
-            st.session_state[key] = data[key]
+            _persist_set(key, data[key])
     if data.get("defrost_power_w") is not None:
-        st.session_state["defrost_power_w"] = float(data["defrost_power_w"])
+        _persist_set("defrost_power_w", float(data["defrost_power_w"]))
     if data.get("interp_delta_t_k") is not None:
-        st.session_state["interp_delta_t_k"] = float(data["interp_delta_t_k"])
+        _persist_set("interp_delta_t_k", float(data["interp_delta_t_k"]))
     if "heater_advances_timer" in data:
-        st.session_state["heater_advances_timer"] = bool(data["heater_advances_timer"])
+        _persist_set("heater_advances_timer", bool(data["heater_advances_timer"]))
     tests_in = data.get("tests")
     if tests_in:
         restored = []
@@ -1772,15 +2192,7 @@ def _apply_campaign_settings(data: dict) -> None:
             parent = Path(power_glob.replace("\\", "/")).parent
             if str(parent) not in {"", "."}:
                 power_folder = str(Path(power_glob).parent)
-    st.session_state["power_folder"] = power_folder
-    st.session_state["power_folder_text"] = power_folder
-    if tests_in:
-        for i, t in enumerate(st.session_state.get("tests") or []):
-            st.session_state[f"n_{i}"] = t.get("name") or ""
-            st.session_state[f"a_{i}"] = int(t.get("ambient_c") or 32)
-            st.session_state[f"vs_{i}"] = t.get("vs_target") or "onder"
-            st.session_state[f"tf_{i}"] = t.get("temp_folder") or ""
-            st.session_state[f"t_{i}"] = t.get("temp_file") or ""
+    _set_stored_power_folder(power_folder)
     _reload_configured_folders()
 
 
@@ -1831,15 +2243,14 @@ def _render_campaign_power() -> None:
                 st.session_state["pending_power_folder"] = folder
                 st.rerun()
 
-    folder_key = "power_folder_text"
-    if folder_key not in st.session_state:
-        st.session_state[folder_key] = st.session_state.get("power_folder") or ""
-    new_folder = st.text_input("Pad van de power-map", key=folder_key)
-    if new_folder != (st.session_state.get("power_folder") or ""):
+    stored_folder = _stored_power_folder()
+    new_folder = st.text_input("Pad van de power-map", value=stored_folder)
+    if _norm_path(new_folder) and _norm_path(new_folder) != stored_folder:
         _apply_campaign_power(new_folder)
+        stored_folder = _stored_power_folder()
 
     pool = _campaign_power_pool()
-    folder = st.session_state.get("power_folder") or ""
+    folder = stored_folder or _stored_power_folder()
     if folder and not Path(folder).is_dir():
         st.warning(f"Power-map bestaat nog niet: {folder}. Zet de CSV’s in deze map.")
     elif pool:
@@ -1856,9 +2267,10 @@ def _render_campaign_power() -> None:
 def _render_settings_io() -> None:
     st.markdown("**Instellingen opslaan en openen**")
     st.caption(
-        "De JSON bevat compartimenten, sensoren én de lokale mappen (power-map en "
-        "temperatuurmap per meetpunt). Voor een volgende koelkast met dezelfde "
-        "compartimenten: zet nieuwe bestanden in diezelfde mappen en laad alleen deze JSON."
+        "De JSON bevat compartimenten, omgeving-/gradiëntsensoren, ΔT, ontdooi-drempel "
+        "én de lokale mappen (power-map en temperatuurmap per meetpunt). "
+        "Voor een volgende koelkast met dezelfde compartimenten: zet nieuwe bestanden "
+        "in diezelfde mappen en laad alleen deze JSON."
     )
     local = _is_local_client()
     payload = json.dumps(_campaign_settings(), indent=2, default=str)
@@ -1968,17 +2380,20 @@ def _render_temp_files(test: dict, index: int) -> None:
                 st.rerun()
 
     tf_key, t_key = f"tf_{index}", f"t_{index}"
-    if tf_key not in st.session_state:
-        st.session_state[tf_key] = test.get("temp_folder") or ""
-    if t_key not in st.session_state:
-        st.session_state[t_key] = test.get("temp_file") or ""
-    new_folder = st.text_input("Pad van de temperatuurmap", key=tf_key)
-    if new_folder != (test.get("temp_folder") or ""):
+    stored_folder = _norm_path(test.get("temp_folder"))
+    new_folder = st.text_input(
+        "Pad van de temperatuurmap",
+        value=stored_folder,
+        key=tf_key,
+    )
+    if _norm_path(new_folder) and _norm_path(new_folder) != stored_folder:
         _apply_temp_folder(test, new_folder, index)
+        stored_folder = _norm_path(test.get("temp_folder"))
     else:
-        test["temp_folder"] = new_folder
-    if new_folder and not Path(new_folder).is_dir():
-        st.warning(f"Temperatuurmap bestaat nog niet: {new_folder}")
+        test["temp_folder"] = stored_folder or _norm_path(new_folder)
+    shown_folder = _norm_path(test.get("temp_folder")) or stored_folder
+    if shown_folder and not Path(shown_folder).is_dir():
+        st.warning(f"Temperatuurmap bestaat nog niet: {shown_folder}")
 
     candidates = test.get("temp_candidates")
     if candidates is None and test.get("temp_folder"):
@@ -2008,12 +2423,18 @@ def _render_temp_files(test: dict, index: int) -> None:
     elif len(candidates) == 1:
         st.caption(f"Automatisch gekozen: {Path(candidates[0]).name}")
     else:
-        new_temp = st.text_input("Temperatuur-CSV (bestand)", key=t_key)
-        if new_temp != (test.get("temp_file") or ""):
+        new_temp = st.text_input(
+            "Temperatuur-CSV (bestand)",
+            value=_norm_path(test.get("temp_file")),
+            key=t_key,
+        )
+        if _norm_path(new_temp) and new_temp != (test.get("temp_file") or ""):
             test["temp_file"] = new_temp
             _sync_power_selection(test)
+        elif _norm_path(test.get("temp_file")):
+            pass
         else:
-            test["temp_file"] = new_temp
+            test["temp_file"] = _norm_path(new_temp)
 
     selected = [p for p in (test.get("power_selected") or []) if Path(p).is_file()]
     pool = _power_pool(test)
@@ -2065,13 +2486,21 @@ def apply_appliance_config() -> dict:
             "target_temp": float(row.get("target_c", _default_target_c(table_type))),
             "table_type": table_type,
         }
-    amb = [s.strip() for s in st.session_state["ambient_sensors"].split(",") if s.strip()]
-    grad = [s.strip() for s in st.session_state["gradient_sensors"].split(",") if s.strip()]
+    amb = [
+        s.strip()
+        for s in str(_persist_get("ambient_sensors") or "").split(",")
+        if s.strip()
+    ]
+    grad = [
+        s.strip()
+        for s in str(_persist_get("gradient_sensors") or "").split(",")
+        if s.strip()
+    ]
     analysis.configure_appliance(
         new,
         ambient_sensors=amb,
         gradient_sensors=grad,
-        defrost_power_w=float(st.session_state.get("defrost_power_w", 50.0)),
+        defrost_power_w=float(_persist_get("defrost_power_w", 50.0)),
     )
     st.session_state["compartments_ui"] = rows
     return new
@@ -2679,6 +3108,27 @@ def collected_points() -> list[en62552.TestPoint]:
     return points
 
 
+def _test_files_ready(test: dict) -> bool:
+    temp_path = _resolve_temp_path(test.get("temp_file") or "")
+    return bool(temp_path and Path(temp_path).is_file())
+
+
+def _analyze_test_catch(test: dict) -> str | None:
+    try:
+        run_full_test(test)
+        st.session_state["analyse_error"] = None
+        _snapshot_analysis(test)
+        return None
+    except analysis.SS1NotFoundError as exc:
+        st.session_state["analyse_error"] = str(exc)
+        _snapshot_analysis(test)
+        return str(exc)
+    except Exception as exc:
+        st.session_state["analyse_error"] = str(exc)
+        _snapshot_analysis(test)
+        return str(exc)
+
+
 def run_full_test(test: dict) -> None:
     _clear_analysis()
     apply_appliance_config()
@@ -2714,7 +3164,7 @@ def run_full_test(test: dict) -> None:
         lambda: analysis.detect_tcc_cycles(
             df.lazy(),
             make_plots=False,
-            defrost_power_w=float(st.session_state.get("defrost_power_w", 50.0)),
+            defrost_power_w=float(_persist_get("defrost_power_w", 50.0)),
         )
     )
     st.session_state["df_TCC"] = df_TCC
@@ -2922,6 +3372,8 @@ if nav == "need":
     )
 
 elif nav == "appliance":
+    _render_settings_io()
+    st.divider()
     st.subheader("Compartimenten")
     st.caption(
         "Wijzig naam, type en volume, of voeg rijen toe. Type volgt Tabel 1 van de norm. "
@@ -2996,18 +3448,27 @@ elif nav == "appliance":
         "Doeltemperatuur start op de Tabel 1-waarde; die kun je per rij wijzigen. "
         "Gebruik + onder de tabel of de knop hierboven om een rij toe te voegen."
     )
-    st.number_input(
+    interp_val = st.number_input(
         "Max. ΔT voor interpolatie (K)",
         min_value=0.5,
         max_value=20.0,
         step=0.5,
         format="%.1f",
-        key="interp_delta_t_k",
+        value=float(_persist_get("interp_delta_t_k", 4.0)),
         help="Annex E.3: interpolatie alleen als |T_onder − T_boven| niet groter is dan deze waarde. Standaard 4 K.",
     )
+    _persist_set("interp_delta_t_k", float(interp_val))
 
-    st.text_input("Omgevingssensoren", key="ambient_sensors")
-    st.text_input("Gradiëntsensoren", key="gradient_sensors")
+    ambient_val = st.text_input(
+        "Omgevingssensoren",
+        value=str(_persist_get("ambient_sensors") or ""),
+    )
+    _persist_set("ambient_sensors", ambient_val)
+    gradient_val = st.text_input(
+        "Gradiëntsensoren",
+        value=str(_persist_get("gradient_sensors") or ""),
+    )
+    _persist_set("gradient_sensors", gradient_val)
 
     st.subheader("Ontdooiregelaar")
     st.info(
@@ -3016,19 +3477,21 @@ elif nav == "appliance":
         "Als de CV van Δtrt ≥ 10 % waarschuwt het programma dat het geen CRT-regelaar lijkt "
         "(elapsed-time of variable/demand-defrost)."
     )
-    st.number_input(
+    defrost_val = st.number_input(
         "Ontdooi als vermogen P groter is dan (W)",
         min_value=0.0,
         max_value=5000.0,
         step=5.0,
         format="%.1f",
-        key="defrost_power_w",
+        value=float(_persist_get("defrost_power_w", 50.0)),
         help="Een TCC telt als ontdooi-cyclus als er ergens in die cyclus P boven deze drempel komt. Standaard 50 W. Zet hoger als normale compressor-aan al boven 50 W zit.",
     )
-    st.checkbox(
+    _persist_set("defrost_power_w", float(defrost_val))
+    heater_val = st.checkbox(
         "Timer loopt door tijdens ontdooiverwarming (Δtdh > 0) — nog niet gemeten, alleen ter info",
-        key="heater_advances_timer",
+        value=bool(_persist_get("heater_advances_timer", False)),
     )
+    _persist_set("heater_advances_timer", bool(heater_val))
     if st.button("Toestelconfiguratie toepassen"):
         try:
             apply_appliance_config()
@@ -3045,8 +3508,45 @@ elif nav == "tests":
         "De exacte instelwaarde hoeft niet bekend te zijn: kouder of warmer dan target."
     )
     _render_campaign_power()
+    tests = st.session_state["tests"]
+    ready = [(i, t) for i, t in enumerate(tests) if _test_files_ready(t)]
     st.divider()
-    _render_settings_io()
+    run_all_cols = st.columns([2, 3])
+    run_all_disabled = not ready
+    if run_all_cols[0].button(
+        f"Alle ingevoerde meetpunten analyseren ({len(ready)})",
+        disabled=run_all_disabled,
+        help="Voert de analyse uit voor elk meetpunt waarvoor een temperatuurbestand is gekozen.",
+    ):
+        ok: list[str] = []
+        fail: list[str] = []
+        last_ok: int | None = None
+        with st.spinner(f"Analyse van {len(ready)} meetpunt(en)…"):
+            for i, test in ready:
+                err = _analyze_test_catch(test)
+                if err:
+                    fail.append(f"{test['name']}: {err}")
+                else:
+                    ok.append(test["name"])
+                    last_ok = i
+        parts = []
+        if ok:
+            parts.append(f"Geanalyseerd: {', '.join(ok)}.")
+        if fail:
+            parts.append("Mislukt: " + " | ".join(fail))
+        st.session_state["flash"] = " ".join(parts) or "Geen meetpunten met bestanden."
+        if last_ok is not None:
+            st.session_state["active_test"] = last_ok
+            st.session_state["analyse_saved_select"] = last_ok
+            _restore_analysis(tests[last_ok])
+        st.rerun()
+    if run_all_disabled:
+        run_all_cols[1].caption("Kies eerst per meetpunt een temperatuurbestand.")
+    else:
+        run_all_cols[1].caption(
+            "Analyseert alleen meetpunten met een temperatuurbestand. "
+            "Power komt uit de map hierboven."
+        )
     st.divider()
     for i, test in enumerate(st.session_state["tests"]):
         side = VS_TARGET_OPTIONS.get(test.get("vs_target", "onder"), test.get("vs_target"))
@@ -3055,11 +3555,15 @@ elif nav == "tests":
             expanded=i == 0,
         ):
             c1, c2 = st.columns(2)
-            test["name"] = c1.text_input("Naam", test["name"], key=f"n_{i}")
+            test["name"] = c1.text_input(
+                "Naam",
+                value=str(test.get("name") or ""),
+                key=f"n_{i}",
+            )
             test["ambient_c"] = c2.selectbox(
                 "Omgeving Tamb",
                 options=[16, 32],
-                index=0 if int(test["ambient_c"]) == 16 else 1,
+                index=0 if int(test.get("ambient_c") or 32) == 16 else 1,
                 key=f"a_{i}",
             )
             current_vs = test.get("vs_target", "onder")
@@ -3124,16 +3628,12 @@ elif nav == "tests":
             cols = st.columns(3)
             if cols[0].button("Analyseren", key=f"run_{i}"):
                 st.session_state["active_test"] = i
-                try:
-                    with st.spinner(f"Analyse van {test['name']}…"):
-                        run_full_test(test)
-                    st.session_state["analyse_error"] = None
+                with st.spinner(f"Analyse van {test['name']}…"):
+                    err = _analyze_test_catch(test)
+                if err:
+                    st.session_state["analyse_error"] = err
+                else:
                     st.session_state["flash"] = f"Meetpunt '{test['name']}' geanalyseerd."
-                except analysis.SS1NotFoundError as exc:
-                    st.session_state["analyse_error"] = str(exc)
-                except Exception as exc:
-                    st.session_state["analyse_error"] = str(exc)
-                _snapshot_analysis(test)
                 st.session_state["analyse_saved_select"] = i
                 st.session_state["pending_nav_tab"] = "analyse"
                 st.rerun()
@@ -3180,7 +3680,7 @@ elif nav == "view":
             "Vermogen uit de hele power-map, chronologisch achter elkaar. "
             "Gekleurde banden markeren de temperatuurmetingen. "
             "Ontdooiingen tussen die metingen blijven zichtbaar in P "
-            f"(punten boven de drempel van {float(st.session_state.get('defrost_power_w', 50.0)):g} W)."
+            f"(punten boven de drempel van {float(_persist_get('defrost_power_w', 50.0)):g} W)."
         )
         if not _campaign_power_pool():
             st.info("Kies eerst de power-map in het tabblad Meetpunten.")
@@ -3211,7 +3711,7 @@ elif nav == "view":
                 fig_p = _plotly_continuous_power(
                     df_p,
                     tests,
-                    float(st.session_state.get("defrost_power_w", 50.0)),
+                    float(_persist_get("defrost_power_w", 50.0)),
                 )
                 st.plotly_chart(
                     fig_p,
